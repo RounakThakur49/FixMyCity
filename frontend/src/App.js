@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import './App.css';
+import { validateAadhaar } from './aadhaar';
 import Header from './components/Header';
 import Hero from './components/Hero';
 import CitizenDashboard from './components/CitizenDashboard';
@@ -114,21 +115,39 @@ function App() {
     }
   };
 
+  // Authorization header for write routes. Reads stay public. `session.token`
+  // is the JWT issued at login/register and persisted with the session.
+  const authHeaders = () =>
+    session?.token ? { Authorization: `Bearer ${session.token}` } : {};
+
+  // A 401 on a write means the token is missing/expired — force a clean re-login
+  // instead of leaving the user in a half-broken state.
+  const handleExpiredSession = () => {
+    setSession(null);
+    alert('Your session has expired. Please log in again.');
+  };
+
   const updateProfile = async (updatedData) => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/auth/update-profile`, {
         method: 'PATCH',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true'
+          'ngrok-skip-browser-warning': 'true',
+          ...authHeaders(),
         },
         body: JSON.stringify(updatedData)
       });
+      if (res.status === 401) {
+        handleExpiredSession();
+        return { success: false, message: 'Session expired. Please log in again.' };
+      }
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.message || 'Failed to update profile.');
       }
-      setSession(data.user);
+      // Preserve the existing token — update-profile returns the user only.
+      setSession((prev) => ({ ...data.user, token: prev?.token }));
       return { success: true };
     } catch (err) {
       console.error('Update profile error:', err);
@@ -255,7 +274,7 @@ function App() {
         return;
       }
 
-      setSession(data.user);
+      setSession({ ...data.user, token: data.token });
       await refreshComplaints();
     } catch (err) {
       console.error('Login error:', err);
@@ -270,8 +289,9 @@ function App() {
     event.preventDefault();
     setAuthMessage('');
 
-    if (!/^\d{12}$/.test(registerForm.aadhar.trim())) {
-      setAuthMessage('Aadhar number must be exactly 12 digits.');
+    const aadhaarCheck = validateAadhaar(registerForm.aadhar.trim());
+    if (!aadhaarCheck.valid) {
+      setAuthMessage(aadhaarCheck.message);
       return;
     }
 
@@ -385,7 +405,8 @@ async function handleComplaintSubmit(event) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true'
+          'ngrok-skip-browser-warning': 'true',
+          ...authHeaders()
         },
         body: JSON.stringify({
           citizenName: session.name,
@@ -402,6 +423,10 @@ async function handleComplaintSubmit(event) {
         }),
       });
 
+      if (res.status === 401) {
+        handleExpiredSession();
+        return false;
+      }
       if (!res.ok) {
         const data = await res.json();
         // HTTP 422 = image blocked by AI classifier
@@ -456,14 +481,21 @@ async function handleComplaintSubmit(event) {
         `${API_BASE_URL}/api/complaints/${complaintId}/status`,
         {
           method: 'PATCH',
-          headers: { 
+          headers: {
             'Content-Type': 'application/json',
-            'ngrok-skip-browser-warning': 'true'
+            'ngrok-skip-browser-warning': 'true',
+            ...authHeaders()
           },
           body: JSON.stringify({ status: nextStatus, forwardedTo }),
         }
       );
 
+      if (res.status === 401 || res.status === 403) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) handleExpiredSession();
+        else alert(data.message || 'Admin privileges required.');
+        return;
+      }
       if (!res.ok) {
         const data = await res.json();
         alert(data.message || 'Failed to update status.');
@@ -486,12 +518,18 @@ async function handleComplaintSubmit(event) {
     try {
       const res = await fetch(
         `${API_BASE_URL}/api/complaints/${complaintId}`,
-        { 
+        {
           method: 'DELETE',
-          headers: { 'ngrok-skip-browser-warning': 'true' }
+          headers: { 'ngrok-skip-browser-warning': 'true', ...authHeaders() }
         }
       );
 
+      if (res.status === 401 || res.status === 403) {
+        const data = await res.json().catch(() => ({}));
+        if (res.status === 401) handleExpiredSession();
+        else alert(data.message || 'Admin privileges required.');
+        return;
+      }
       if (!res.ok) {
         const data = await res.json();
         alert(data.message || 'Failed to delete complaint.');
@@ -514,9 +552,10 @@ async function handleComplaintSubmit(event) {
     try {
       const res = await fetch(`${API_BASE_URL}/api/reviews`, {
         method: 'POST',
-        headers: { 
+        headers: {
           'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true'
+          'ngrok-skip-browser-warning': 'true',
+          ...authHeaders()
         },
         body: JSON.stringify(reviewData),
       });

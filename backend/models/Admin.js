@@ -15,9 +15,12 @@ const AdminSchema = new mongoose.Schema({
   password: {
     type: String,
     required: true,
+    // Never ship the bcrypt hash by default; opt in with .select('+password').
+    select: false,
   },
   role: {
     type: String,
+    enum: ['admin'],
     default: 'admin',
   },
 }, {

@@ -10,7 +10,13 @@ import json
 import sys
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+
+# CANONICAL PREPROCESSING CONTRACT (IMPLEMENTATION_SPEC.md §1):
+# EfficientNetB0 path is fed RAW float32 [0,255] RGB, bilinear-resized to 224x224.
+# NO external normalization (efficientnet.preprocess_input is a documented no-op;
+# the Normalization/Rescaling is baked inside the Keras EfficientNetB0 graph).
+# Do NOT apply /255, /127.5-1, or mobilenet_v2.preprocess_input here — doing so
+# creates train/infer/audit skew and makes every audit conclusion garbage.
 
 DATASET_DIR = "my_dataset"
 MODEL_PATH = "civic_model.keras"
@@ -27,9 +33,28 @@ if not os.path.exists(LABELS_PATH):
     sys.exit(1)
 
 print("Loading model...")
-model = tf.keras.models.load_model(MODEL_PATH)
+model = tf.keras.models.load_model(MODEL_PATH, compile=False)
 labels = json.load(open(LABELS_PATH))
 print(f"Classes: {labels}")
+print("[preprocess] EfficientNet raw [0,255], bilinear 224")
+
+# The model may be dual-output [logits, probs] (IMPLEMENTATION_SPEC.md §2.1) or a
+# legacy single-softmax head. select_probs() returns the softmax-probability head
+# in both cases so audits run identically regardless of model vintage.
+def select_probs(model, preds):
+    """Return the softmax-probability output for single- or dual-head models."""
+    if isinstance(preds, (list, tuple)):
+        names = list(getattr(model, "output_names", []) or [])
+        if "probs" in names:
+            return np.asarray(preds[names.index("probs")])
+        # Fallback: pick the head whose rows look like probabilities (>=0, sum~1).
+        for p in preds:
+            arr = np.asarray(p)
+            if arr.ndim == 2 and np.all(arr >= 0) and np.allclose(
+                arr.sum(axis=1), 1.0, atol=1e-2):
+                return arr
+        return np.asarray(preds[-1])
+    return np.asarray(preds)
 
 # Folder name -> expected label
 folder_to_label = {
@@ -59,8 +84,9 @@ for folder, expected_label in folder_to_label.items():
         if not batch_imgs:
             return
         arr = np.stack(batch_imgs, axis=0)
-        arr = preprocess_input(arr)
+        # Raw [0,255] RGB float32 — NO preprocess_input (see contract above).
         preds = model.predict(arr, verbose=0)
+        preds = select_probs(model, preds)
         for name, p in zip(batch_names, preds):
             top_idx = int(np.argmax(p))
             top_label = labels[top_idx]
@@ -79,7 +105,8 @@ for folder, expected_label in folder_to_label.items():
     for fname in files:
         path = os.path.join(folder_path, fname)
         try:
-            img = tf.keras.utils.load_img(path, target_size=IMG_SIZE)
+            img = tf.keras.utils.load_img(
+                path, target_size=IMG_SIZE, interpolation="bilinear")
             arr = tf.keras.utils.img_to_array(img)
             batch_imgs.append(arr)
             batch_names.append(fname)

@@ -5,16 +5,19 @@ const ReviewSchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true,
+    maxlength: 200,
   },
   role: {
     type: String,
     required: true,
     trim: true,
+    maxlength: 200,
   },
   quote: {
     type: String,
     required: true,
     trim: true,
+    maxlength: 2000,
   },
   avatar: {
     type: String,
@@ -34,5 +37,8 @@ const ReviewSchema = new mongoose.Schema({
 }, {
   timestamps: true,
 });
+
+// The reviews list is always fetched sorted by newest first.
+ReviewSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('Review', ReviewSchema);

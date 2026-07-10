@@ -10,13 +10,13 @@ Built for **SIH PS 25031** (Smart India Hackathon — Civic Issue Reporting).
 
 | Layer | Tech |
 |-------|------|
-| Frontend | React 19 (Create React App), framer-motion, lucide-react |
-| Backend | Node.js 20 LTS, Express 4, Mongoose, bcryptjs |
+| Frontend | React 19 (Create React App), framer-motion, lucide-react, Google Maps |
+| Backend | Node.js 20 LTS, Express 4, Mongoose, bcryptjs, helmet, express-rate-limit |
 | Database | MongoDB (Atlas cluster or local) |
-| AI advisory | `@tensorflow/tfjs` + `@tensorflow-models/mobilenet` (ImageNet, advisory mode) |
-| Training (optional) | Python 3.11, TensorFlow / Keras, scikit-learn |
+| ML (runtime) | `@tensorflow/tfjs` (pure-JS), `nsfwjs`, `@xenova/transformers` (CLIP) |
+| ML (training) | Python 3.11, TensorFlow/Keras, EfficientNetV2S backbone, scikit-learn |
 
-The classifier runs in **advisory mode** — it tags every uploaded image with an AI commentary but never blocks a submission. See [AI advisory](#ai-advisory) below.
+The image validation pipeline runs a **custom 4-class civic model** (EfficientNetV2S, trained on ~5,500 images) that can block submissions when the photo doesn't match the declared category. NSFW content moderation blocks inappropriate uploads. An advisory mode degrades gracefully when model confidence is low.
 
 ---
 
@@ -25,13 +25,13 @@ The classifier runs in **advisory mode** — it tags every uploaded image with a
 - **Node.js 20 LTS** — verify with `node -v`. Install via [nvm-windows](https://github.com/coreybutler/nvm-windows) (Windows) or [nvm](https://github.com/nvm-sh/nvm) (mac/Linux).
 - **MongoDB** — either a free [MongoDB Atlas](https://www.mongodb.com/atlas) cluster (recommended) or a local `mongod` instance.
 - **Git**
-- **(Optional) Python 3.11** + venv — only needed if you want to retrain the custom classifier on your own dataset.
+- **(Optional) Python 3.9+** + venv — only needed to retrain the classifier on your own dataset.
 
 > Node 24 will fail. TensorFlow.js native prebuilts don't ship for NAPI v10, so stay on Node 20.
 
 ---
 
-## Quick start (clone-and-run)
+## Quick start
 
 ### 1. Clone
 
@@ -42,15 +42,12 @@ cd FixMyCity
 
 ### 2. MongoDB
 
-**Option A — MongoDB Atlas (recommended for first-timers):**
+**Option A — MongoDB Atlas (recommended):**
 
 1. Create a free cluster at https://cloud.mongodb.com/
-2. Database Access → add user `your_user` with password.
+2. Database Access → add user with password.
 3. Network Access → add IP `0.0.0.0/0` (or your IP).
-4. Cluster → Connect → Drivers → copy the connection string. Example:
-   ```
-   mongodb+srv://your_user:your_pass@cluster.xxxxx.mongodb.net/FixMyCity?retryWrites=true&w=majority
-   ```
+4. Cluster → Connect → Drivers → copy the connection string.
 
 **Option B — local MongoDB:**
 
@@ -68,7 +65,10 @@ Create `backend/.env`:
 ```env
 MONGO_URI=mongodb+srv://your_user:your_pass@cluster.xxxxx.mongodb.net/FixMyCity?retryWrites=true&w=majority
 PORT=5000
+JWT_SECRET=change-me-to-a-long-random-string
 ```
+
+> **`JWT_SECRET` is required for real auth.** If unset, the server falls back to an insecure dev value and warns at boot — fine for local dev, never for a deployed/Vercel build. Generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`.
 
 Start backend:
 
@@ -80,12 +80,12 @@ Expected boot output:
 
 ```
 Express server running on port 5000
-Loading MobileNet (ImageNet)...
 Connected to MongoDB.
-MobileNet loaded. Civic categories: [ 'drainage', 'others', 'potholes', 'streetlight' ]
+[nsfw] Content moderation model ready.
+[civic] Civic graph model loaded. Classes: [ 'drainage', 'others', 'potholes', 'streetlight' ]
+[civic] Logits head present: true
+[clip] Others open-set classifier ready.
 ```
-
-> First boot downloads MobileNet (~14 MB) from Google's TFHub CDN. Needs internet on first run.
 
 ### 4. Frontend
 
@@ -103,11 +103,13 @@ App opens at `http://localhost:3000`.
 
 | Role | Username | Password |
 |------|----------|----------|
-| Admin | `admin@fixmycity` | `admin123` |
+| Admin | `admin@fixmycity` | `rounak123` |
 | Citizen | `9876543210` | `citizen123` |
 | Citizen | `9123456780` | `citizen123` |
 
 These are seeded automatically on first connect (only if the DB is empty).
+
+> **Auth (July 2026):** login/register return a signed **JWT**. The frontend stores it in the `session` object and sends `Authorization: Bearer <token>` on all writes. Reads (`GET`) stay public. Server-side middleware enforces roles — a citizen token cannot hit admin routes (status/delete). A 401 on any write forces a clean re-login.
 
 ---
 
@@ -117,16 +119,21 @@ These are seeded automatically on first connect (only if the DB is empty).
 curl http://localhost:5000/api/health
 ```
 
-Expected response:
+---
 
-```json
-{
-  "ok": true,
-  "model_loaded": true,
-  "classes": ["drainage", "others", "potholes", "streetlight"],
-  "classifier": "mobilenet-imagenet+keywords (advisory mode — never blocks)"
-}
+## Testing (E2E)
+
+Playwright suite in `tests/e2e/complaints.spec.js` (UI structure, health/model, ML accept/block, input validation, **JWT auth/authorization, Aadhaar Verhoeff validation**).
+
+```bash
+# With backend + frontend running (backend via `npm run dev`):
+DISABLE_RATE_LIMIT=true npx playwright test
 ```
+
+- `DISABLE_RATE_LIMIT=true` (backend env, **dev/test only**) bypasses the 5/min complaint limiter so the suite's rapid POSTs don't 429. Never set in production.
+- The suite logs in once as a seeded citizen in `beforeAll` and attaches the JWT to every `POST /api/complaints` (complaint creation now requires auth). Reads need no token.
+- The image-picking helper skips known-contaminated dataset prefixes (`scrape_`/`drain_`/`bing_`) so ACCEPT assertions run on clean images.
+- HTML report: `playwright-report/`.
 
 ---
 
@@ -134,227 +141,238 @@ Expected response:
 
 ```
 FixMyCity/
-├── backend/
-│   ├── server.js                  # Express + MongoDB + MobileNet classifier
-│   ├── models/                    # User.js, Admin.js, Complaint.js
-│   ├── .env                       # MONGO_URI (you create this)
-│   ├── civic_model.keras          # custom Keras model (training output)
-│   ├── civic_labels.json          # class order
-│   ├── civic_model_tfjs/          # TFJS-converted custom model (not used at runtime)
-│   ├── my_dataset/                # training images per class
-│   │   ├── potholes/
-│   │   ├── drainage/
-│   │   ├── streetlight/
-│   │   └── others/
-│   ├── train_civic_model.py       # MobileNetV2 transfer-learning script
-│   ├── audit_dataset.py           # checks training labels with trained model
-│   ├── download_datasets.py       # Bing/Kaggle scraper for dataset
-│   └── clean_datasets.py          # dedupe + filter
+├── backend/                        # modular Express app (July 2026 refactor)
+│   ├── server.js                   # thin composition root (~115 lines)
+│   ├── config/db.js                # connectDB(): mongoose connect + seed
+│   ├── db/seed.js                  # default users/complaints seeding
+│   ├── middleware/
+│   │   ├── security.js             # helmet, cors, rate limiters
+│   │   └── auth.js                 # JWT issue/verify, requireAuth/requireAdmin
+│   ├── ml/pipeline.js              # ENTIRE ML pipeline (NSFW+civic+OOD+CLIP)
+│   ├── routes/                     # health, stats, auth, complaints, reviews
+│   ├── utils/                      # datetime, aadhaar mask
+│   ├── aadhaar.js                  # Verhoeff validation (shared w/ frontend)
+│   ├── others_clip.js              # CLIP open-set classifier for "Others"
+│   ├── models/                     # Mongoose schemas (User, Admin, Complaint, Review)
+│   ├── server.monolith.bak.js      # pre-refactor backup (delete once stable)
+│   ├── .env                        # MONGO_URI, JWT_SECRET (you create this)
+│   ├── train_civic_model.py        # EfficientNetV2S 3-stage training
+│   ├── temperature_scaling.py      # Post-training threshold calibration
+│   ├── audit_dataset.py            # Dataset quality audit
+│   ├── civic_model.keras           # Keras source-of-truth model
+│   ├── civic_labels.json           # Class order
+│   ├── civic_thresholds.json       # Calibrated thresholds + OOD config
+│   ├── civic_model_tfjs/           # TFJS-converted model (loaded at runtime)
+│   └── my_dataset/                 # Training images (gitignored)
+│       ├── potholes/   (~1,578)
+│       ├── streetlight/ (~1,640)
+│       ├── drainage/   (~1,101)
+│       └── others/     (~1,235)
 ├── frontend/
 │   ├── src/
-│   │   ├── App.js                 # SINGLE SOURCE OF TRUTH — all state + handlers
-│   │   ├── components/
-│   │   │   ├── CitizenDashboard.jsx
-│   │   │   ├── AdminDashboard.jsx
-│   │   │   ├── ComplaintForm.jsx
-│   │   │   ├── Hero.jsx
-│   │   │   └── ...
-│   │   └── ...
+│   │   ├── App.js                  # Single source of truth — all state + handlers
+│   │   ├── aadhaar.js              # Verhoeff validation (mirror of backend)
+│   │   ├── App.css                 # Styles
+│   │   └── components/
+│   │       ├── Hero.jsx            # Landing page + auth forms
+│   │       ├── CitizenDashboard.jsx
+│   │       ├── AdminDashboard.jsx
+│   │       ├── ComplaintForm.jsx
+│   │       ├── ComplaintDetail.jsx
+│   │       ├── GoogleMap.jsx
+│   │       ├── Header.jsx
+│   │       └── Timeline.jsx
 │   └── public/
-├── CLAUDE.md                      # internal contributor guide
-└── README.md                      # this file
+├── tests/e2e/                      # Playwright suite
+├── CLAUDE.md                       # AI assistant instructions + roadmap
+└── README.md                       # This file
 ```
 
 ---
 
-## AI Moderation & Validation
+## AI Image Validation Pipeline
 
-The backend uses a **custom 4-class Civic AI Model** (MobileNetV2 base, fine-tuned on custom datasets) to strictly enforce category correctness and block invalid submissions. It no longer relies on the generic ImageNet classifier.
+The backend runs a multi-stage ML pipeline on every complaint photo upload:
 
-### Features
-1. **Cross-Category Enforcement**: If a user submits a pothole image but selects "Broken street light problem", the API will reject the request with HTTP 422 and prompt them to use the correct category.
-2. **"Others" Keyword Routing**: When the "Others" category is selected, the API scans the problem title. If it contains words like `pothole`, `drain`, or `light`, it dynamically overrides the validation target to the specific class, preventing users from bypassing filters by just clicking "Others".
-3. **Threshold Calibration**: Confidence thresholds are individually configured per class in `civic_thresholds.json`.
+### Stage 1: NSFW Content Moderation
+`nsfwjs` checks for adult/explicit content. Porn/Hentai >40% or Sexy >70% → **hard-block** (HTTP 422).
 
-Pipeline in `backend/server.js`:
+### Stage 2: Civic Category Classification
+Custom **EfficientNetV2S** model (4 classes: drainage, potholes, streetlight, others) trained on ~5,500 images with:
+- 3-stage progressive unfreezing (head → top-60 layers → full backbone)
+- Focal Loss with class weights + drainage boost
+- CutMix/Mixup augmentation
+- Dual-output head (logits + softmax) for proper calibration
 
-1. `loadCivicModel()` loads the TFJS layers model from `backend/civic_model_tfjs` at boot.
-2. On `POST /api/complaints`, the image is base64-decoded and classified.
-3. The model returns probabilities for `drainage`, `others`, `potholes`, and `streetlight`.
-4. `decideBlock()` compares the top probability against the required threshold and blocks if the mismatch is severe or confidence is too low.
+### Stage 3: Decision Logic
+Temperature-calibrated probabilities feed three blocking rules:
+- **OOD detection**: Energy-based (logits) or entropy (softmax) — rejects non-civic images
+- **Low confidence**: Declared category below calibrated threshold → block
+- **Category mismatch**: Different category is ahead by a margin → block
 
-Backend log per submit:
-```
-[civic] Civic graph model loaded. Classes: [ 'drainage', 'others', 'potholes', 'streetlight' ]
-  Pothole→Drainage BLOCKED: potholes(100%) vs declared(0%)
-```
+### Stage 4: Open-set "Others"
+CLIP (`@xenova/transformers`, Xenova/clip-vit-base-patch32) scores image+title against per-category exemplar embeddings. Never blocks — advisory only.
+
+### Current model performance (EfficientNetV2S, July 2026 retrain)
+| Metric | Value |
+|--------|-------|
+| val_macro_f1 | 0.952 |
+| val_accuracy | 96.8% |
+| Temperature | 0.5736 |
+| OOD | energy-based (threshold −2.296) |
+
+| Class | Precision | Recall | F1 | Threshold |
+|-------|-----------|--------|----|-----------|
+| drainage | 0.70 | 0.99 | 0.82 | 0.063 |
+| potholes | 0.70 | 1.00 | 0.82 | 0.0 |
+| streetlight | 0.70 | 1.00 | 0.82 | 0.0 |
+
+> `potholes`/`streetlight` thresholds are **0.0 by design** — RULE1 (low-confidence block) is disabled for them (high-recall); RULE0 (OOD) and RULE2 (category-mismatch) still guard. `others` is open-set and never blocked. P≈0.70 across classes ⇒ ~30% inter-class false-accept, an accepted tradeoff to avoid rejecting genuine citizen photos.
+
+The classifier **fails open** — ML errors never block citizen submissions.
 
 ---
 
-## Using your own custom data / retraining
-
-You can rebuild the ML dataset and retrain a custom classifier from scratch. The dataset itself is **not tracked in Git** (`.gitignore`) to avoid bloat. Instead, use the provided fetching and cleaning scripts to reproduce it, or supply your own city's images.
+## Retraining the model
 
 ### Step 1 — Python environment
-
-From `backend/`:
 
 ```bash
 cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1    # PowerShell on Windows
 # or: source .venv/bin/activate  (macOS / Linux)
-pip install -r requirements.txt
+pip install tensorflow tensorflowjs scikit-learn pillow
 ```
 
-### Step 2 — Fetch default dataset
+### Step 2 — Prepare dataset
 
-Since the dataset is too large to commit, download the starter images using the provided scripts:
+Place images in `backend/my_dataset/{potholes,drainage,streetlight,others}/`. Recommended: 1,000+ images per class. Mix lighting, angles, urban/rural, day/night. JPG/PNG, any resolution — training resizes to 224×224.
 
-```bash
-python download_datasets.py --target 400
-python clean_datasets.py
-```
+> **WARNING — Dataset contamination (July 2026 audit):** ~30% of the original dataset was junk (NSFW anime, fashion photos, TV posters, puppies, cricket screenshots) from a broken web scraper. The Colab notebook (`FixMyCity_Colab_Train.ipynb`) automatically cleans these before training. **Do not train on the raw dataset without running cleanup first.**
+>
+> Contaminated prefixes (quarantined, not deleted): `drain_*`, `scrape_*`, `bing_*` (drainage); `scrape_*`, `oth_*`, `kag_*` (others). The "others" category is empty after cleanup — rebuild with TACO (trash dataset, CC BY 4.0) + manual civic issue photos.
 
-This script (`download_datasets.py`) scrapes Kaggle and Bing to fetch base images into `backend/my_dataset/`, and then (`clean_datasets.py`) drops irrelevant/noisy images by querying a baseline ImageNet model.
-
-### Step 3 — Add your own custom data (Optional)
-
-You can import your own custom data by placing images into their respective folders under `backend/my_dataset/`:
-
-```
-backend/my_dataset/
-├── potholes/         # Images of road potholes / craters
-├── drainage/         # Images of blocked drains, sewer overflow, manholes
-├── streetlight/      # Images of lamp posts, broken lights
-└── others/           # Miscellaneous civic issues (garbage, leaks, etc.)
-```
-
-Recommended: ≥ 500 images per class for a model that generalizes well. Mix lighting, angles, urban/rural shots, and day/night for variety. JPG/PNG, any resolution — the training script resizes to 224×224.
-
-### Step 4 — Train
+### Step 3 — Train
 
 ```bash
 python train_civic_model.py
 ```
 
-This script:
-- Uses MobileNetV2 (ImageNet weights) as backbone.
-- Trains a head on top (frozen backbone, ~12 epochs).
-- Fine-tunes top 30 layers (~8 epochs).
-- Exports `civic_model.keras` (Keras format) and `civic_model_tfjs/` (TFJS LayersModel).
-- Writes class order to `civic_labels.json`.
+3-stage training: head (30 epochs) → top-60 fine-tune (25 epochs) → full fine-tune (15 epochs). Anti-collapse gate blocks export if macro-F1 < 0.55.
 
-Typical training time: ~10–20 minutes on CPU; <5 minutes on GPU.
+### Training on Google Colab (recommended for speed)
 
-Output console shows per-epoch val_acc. Aim for ≥85% on validation.
+If you have a Google account with Colab access:
 
-### Step 5 — Audit your dataset (optional but recommended)
+1. Zip your `my_dataset/` folder: `cd backend && zip -r my_dataset.zip my_dataset/`
+2. Upload to Google Drive folder named `FixMyCity`:
+   - `my_dataset.zip`
+   - `train_civic_model.py`
+   - `civic_labels.json`
+   - `temperature_scaling.py`
+3. Open `backend/FixMyCity_Colab_Train.ipynb` in Colab
+4. Set runtime to **T4 GPU** (or A100 on Colab Pro)
+5. Run all cells — training takes ~15-30 min on T4
+6. Download `civic_artifacts.zip` and unzip into `backend/`
+7. Run `python temperature_scaling.py` and `npm run dev`
 
-After training, check whether your folder labels match what the model learned:
+The notebook includes JPEG compression artifact simulation to close the domain gap between training images and real citizen phone photos.
+
+### Step 4 — Calibrate thresholds
+
+```bash
+python temperature_scaling.py
+```
+
+Outputs `civic_thresholds.json` with calibrated temperature, per-class thresholds, OOD config, and reliability flags.
+
+### Step 5 — Audit dataset quality
 
 ```bash
 python audit_dataset.py
 ```
 
-Prints per-folder summary:
+Flags images whose folder label disagrees with model prediction. Review `audit_report.csv`, fix misplaced images, retrain.
 
-```
-folder        total  correct  mismatch  low_conf    acc
-potholes        500     485         8         7    97.0%
-drainage        500     441        38        21    88.2%
-streetlight     500     463        19        18    92.6%
-others          500     488         5         7    97.6%
-```
-
-Writes `audit_report.csv` listing every flagged mismatch (filename + expected vs predicted). Open mismatched files and decide: delete junk / move to correct folder. Retrain after cleanup.
-
-### Step 5 — Wire up your custom model
-
-The application is already hardwired to use the local `civic_model_tfjs` directory. 
-
-To update the thresholds or tweak the blocking logic:
-1. Open `backend/civic_thresholds.json` to change the minimum confidence required for each category.
-2. If tests fail due to over-eager blocking, run `python temperature_scaling.py` to calibrate the model confidence scores.
-3. Restart the backend (`npm run dev`) so the new thresholds and model take effect.
-
-### Step 6 — Restart and test
+### Step 6 — Restart backend
 
 ```bash
 npm run dev
 ```
 
-Submit a test complaint per category. Backend log shows classifier verdict per upload.
+---
+
+## API Routes
+
+| Method | Path | Purpose | Auth |
+|--------|------|---------|------|
+| GET | `/api/health` | Health + model status | public |
+| POST | `/api/auth/register` | Register citizen (Aadhaar Verhoeff-validated) → returns JWT | public |
+| POST | `/api/auth/login` | Login (citizen or admin) → returns JWT | public |
+| GET | `/api/stats` | Complaint + user counts | public |
+| GET | `/api/complaints` | List complaints. No params → full array (back-compat). `?page&limit&status` → paginated `{data,page,limit,total,totalPages}` | public |
+| POST | `/api/complaints` | Create complaint (runs ML pipeline) | **citizen+** |
+| PATCH | `/api/complaints/:id/status` | Update status | **admin** |
+| DELETE | `/api/complaints/:id` | Delete complaint | **admin** |
+| GET | `/api/reviews` | List reviews | public |
+| POST | `/api/reviews` | Submit review | **auth** |
+| PATCH | `/api/auth/update-profile` | Update own profile (identity from token) | **auth** |
+
+### Security
+
+- **JWT auth** — login/register issue a signed token (`jsonwebtoken`, `JWT_SECRET` env, 7d expiry). `requireAuth` gates writes, `requireAdmin` gates status/delete. Reads public. `update-profile` derives identity from the token (`req.auth.sub`) — you can only edit your own profile.
+- **Aadhaar validation** — registration runs offline Verhoeff checksum + first-digit (2–9) rule + 12-digit format (`backend/aadhaar.js`). Rejects typos/fakes. Format-valid only, not UIDAI identity proof.
+- **Password never serialized** — `select: false` on `User`/`Admin.password`; opted in only for `bcrypt.compare` / save.
+- **Helmet** — security headers (CSP, X-Frame-Options, HSTS, X-Content-Type-Options)
+- **Rate limiting** — login (10/15min), complaint creation (5/min), global (300/15min)
+- **CORS** — restricted to `localhost:3000`; override via `CORS_ORIGIN` env var (comma-separated origins)
+- **Aadhar masking** — API never exposes full 12-digit national ID (returns `XXXX XXXX 1234`)
+- **Input validation** — maxlength on all string fields, complaint ID format validation, status enum validation, NoSQL-injection guards
+- **Password** — minimum 8 characters, bcrypt hashed (10 rounds)
+
+**Remaining gaps:** JWT lives in `localStorage` (XSS-readable — prefer httpOnly cookie + CSRF for production); no token refresh (7d hard expiry); Aadhaar stored plaintext at rest. See CLAUDE.md "Security posture → Known gaps".
 
 ---
 
-## Custom municipal departments
+## Roadmap (gov-grade production readiness)
 
-To change the list of forwarding targets:
+Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 
-1. Edit `frontend/src/App.js`. Find `authorityOptions` (array of strings) and replace with your city's department list.
-2. Save. CRA hot-reloads. Admin's Forward dropdown now shows the new departments.
+- **Shipped (July 2026):** JWT auth + role middleware, Aadhaar Verhoeff validation, edit-profile fix, live-GPS fix, backend **pagination** (`?page&limit&status`, back-compat), Timeline animation fix, **modular backend** (`server.js` 1610→115 lines; concerns split into `config/ db/ middleware/ ml/ routes/ utils/`).
+- **Next (coordinated FE+BE):** wire the frontend to consume pagination; offload base64 images from MongoDB to **GridFS/S3** with a serving route + one-time migration (must ship with a frontend deploy — base64 rendering changes to URLs).
+- **Then:** `React.memo`/`useCallback` pass, CSS consolidation (3 design systems → 1 token set), keyboard a11y + focus traps (WCAG AA), replace `alert()/confirm()` with the `Toast` component, `controllers/` layer, request-validation middleware, Aadhaar encryption at rest.
 
 ---
 
 ## Common issues
 
-### `npm install` fails on `@tensorflow/tfjs-node`
-You probably installed `tfjs-node` somewhere. This project uses **pure-JS tfjs** (`@tensorflow/tfjs` + `@tensorflow-models/mobilenet`) — no native bindings. Run:
-```bash
-npm uninstall @tensorflow/tfjs-node
-npm install
-```
-
-### `MongoServerError: bad auth`
-Wrong `MONGO_URI` user/password. Atlas treats the password as URL-encoded — special characters like `@`, `:`, `/` must be percent-encoded.
-
-### `MongooseError: Could not connect`
-Atlas Network Access doesn't include your IP. Add `0.0.0.0/0` for development.
-
-### Frontend shows `Could not connect to server`
-Backend isn't running, or wrong port. Check `http://localhost:5000/api/health` returns JSON.
-
-### MobileNet failed to load on backend boot
-First boot needs internet (downloads model from Google CDN). Subsequent boots cache it.
-
-### `node` not found after `nvm use 20`
-Close and reopen PowerShell — Windows PATH cache lag.
+| Problem | Fix |
+|---------|-----|
+| `npm install` fails on `@tensorflow/tfjs-node` | This project uses pure-JS tfjs. Run `npm uninstall @tensorflow/tfjs-node` |
+| `MongoServerError: bad auth` | Wrong MONGO_URI user/password. URL-encode special characters. |
+| `MongooseError: Could not connect` | Atlas Network Access doesn't include your IP. Add `0.0.0.0/0` for dev. |
+| Frontend shows "Could not connect to server" | Backend not running or wrong port. Check `http://localhost:5000/api/health`. |
+| Node 24 errors | Use Node 20 LTS. TFJS native prebuilts don't exist for NAPI v10. |
+| `[civic] civic_model_tfjs/model.json not found` | Train the model first: `python train_civic_model.py` |
+| External images fail classification | Domain gap — retrain with real-world photos. See Colab notebook section. |
+| PNG upload fails | Fixed in latest — `pngjs` handles real PNG images. Run `npm install` to get the dependency. |
 
 ---
 
-## Default routes
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/health` | Health + classifier status |
-| POST | `/api/users/register` | Register citizen |
-| POST | `/api/users/login` | Login citizen |
-| POST | `/api/admins/login` | Login admin |
-| GET | `/api/complaints` | List all complaints |
-| POST | `/api/complaints` | Create complaint (runs classifier) |
-| PATCH | `/api/complaints/:id/status` | Update status (Approve / Forward / Solve) |
-| DELETE | `/api/complaints/:id` | Delete complaint |
-
-**Security note:** API routes are currently unauthenticated. Anyone who reaches them can mutate data. Do not expose to public internet without adding auth.
-
----
-
-## Production build
+## Production
 
 ```bash
-cd frontend
-npm run build
-# output in frontend/build/ — serve with any static host
+cd frontend && npm run build    # output in frontend/build/
 ```
 
-Backend runs as a normal Node process. For production, use `pm2` or `systemd` to keep `npm start` alive in `backend/`.
+Backend: use `pm2` or `systemd` to keep `npm start` alive in `backend/`.
 
 ---
 
 ## License
 
-Internal SIH project. No license declared.
+Internal SIH project.
 
 ## Credits
 
