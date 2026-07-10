@@ -1,0 +1,64 @@
+{
+  "classes": [
+    "drainage",
+    "others",
+    "potholes",
+    "streetlight"
+  ],
+  "confusion_matrix": [
+    [
+      93,
+      0,
+      2,
+      1
+    ],
+    [
+      1,
+      95,
+      4,
+      3
+    ],
+    [
+      4,
+      9,
+      361,
+      2
+    ],
+    [
+      1,
+      5,
+      0,
+      430
+    ]
+  ],
+  "per_class_metrics": {
+    "drainage": {
+      "precision": 0.9394,
+      "recall": 0.9688,
+      "f1": 0.9538,
+      "n_samples": 96
+    },
+    "others": {
+      "precision": 0.8716,
+      "recall": 0.9223,
+      "f1": 0.8962,
+      "n_samples": 103
+    },
+    "potholes": {
+      "precision": 0.9837,
+      "recall": 0.9601,
+      "f1": 0.9717,
+      "n_samples": 376
+    },
+    "streetlight": {
+      "precision": 0.9862,
+      "recall": 0.9862,
+      "f1": 0.9862,
+      "n_samples": 436
+    }
+  },
+  "val_macro_f1_stage1": 0.9132038165535322,
+  "val_macro_f1_stage2": 0.952011826406657,
+  "val_macro_f1_stage3": 0.9461637745677955,
+  "best_macro_f1": 0.952011826406657
+}

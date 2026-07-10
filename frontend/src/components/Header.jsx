@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { Shield, User, LogOut, ChevronDown, Phone, BadgeCheck, Mail, FileText, Edit, X } from 'lucide-react';
 
 export default function Header({ portal, setPortal, session, logout, changeGoogleMapsApiKey, updateProfile }) {
@@ -9,6 +10,15 @@ export default function Header({ portal, setPortal, session, logout, changeGoogl
   const [editError, setEditError] = useState('');
   const [editSuccess, setEditSuccess] = useState('');
   const [isUpdating, setIsUpdating] = useState(false);
+
+  // Close the profile modal on Escape (keyboard accessibility — the modal is
+  // otherwise mouse-only). Listener is only attached while the modal is open.
+  useEffect(() => {
+    if (!modalOpen) return;
+    const onKey = (e) => { if (e.key === 'Escape') setModalOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modalOpen]);
 
   const handleEditSubmit = async (e) => {
     e.preventDefault();
@@ -23,17 +33,14 @@ export default function Header({ portal, setPortal, session, logout, changeGoogl
       setEditError('Phone number must be exactly 10 digits.');
       return;
     }
-    if (!/^\d{12}$/.test(editForm.aadhar.trim())) {
-      setEditError('Aadhar number must be exactly 12 digits.');
-      return;
-    }
 
     setIsUpdating(true);
+    // Aadhaar is an immutable national ID (unique, verified at registration) —
+    // it is intentionally NOT editable here. Identity is derived server-side from
+    // the auth token, so no user id is sent in the body.
     const res = await updateProfile({
-      id: session.id,
       name: editForm.name.trim(),
       phone: editForm.phone.trim(),
-      aadhar: editForm.aadhar.trim(),
       email: editForm.email.trim(),
     });
     setIsUpdating(false);
@@ -274,13 +281,22 @@ export default function Header({ portal, setPortal, session, logout, changeGoogl
         ) : null}
       </nav>
 
-      {/* Profile Edit Modal */}
-      {modalOpen && (
+      {/* Profile Edit Modal — rendered via portal to document.body so the
+          fixed overlay escapes the header's containing block (the header's
+          backdrop-filter/stacking context was scoping `position:fixed` to the
+          64px header, pushing the modal off the top of the screen). */}
+      {modalOpen && createPortal(
         <div className="profile-edit-modal-overlay" onClick={() => setModalOpen(false)}>
-          <div className="profile-edit-modal-container" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="profile-edit-modal-container"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="profile-edit-modal-title"
+          >
             <div className="profile-edit-modal-header">
-              <h3>Edit Profile Information</h3>
-              <button className="profile-edit-modal-close" onClick={() => setModalOpen(false)}>
+              <h3 id="profile-edit-modal-title">Edit Profile Information</h3>
+              <button className="profile-edit-modal-close" onClick={() => setModalOpen(false)} aria-label="Close dialog">
                 <X size={18} />
               </button>
             </div>
@@ -318,19 +334,16 @@ export default function Header({ portal, setPortal, session, logout, changeGoogl
               </div>
 
               <div className="profile-edit-form-group">
-                <label>Aadhar Number</label>
+                <label>Aadhar Number <span style={{ fontWeight: 400, opacity: 0.6, fontSize: '11px' }}>(verified — cannot be changed)</span></label>
                 <div className="profile-edit-input-wrapper">
                   <FileText size={16} className="profile-edit-input-icon" />
                   <input
                     type="text"
-                    required
-                    maxLength={12}
-                    value={editForm.aadhar}
-                    onChange={(e) => {
-                      const val = e.target.value.replace(/\D/g, '');
-                      setEditForm(prev => ({ ...prev, aadhar: val }));
-                    }}
-                    placeholder="Enter 12-digit Aadhar"
+                    readOnly
+                    disabled
+                    value={session.aadhar || '—'}
+                    aria-label="Aadhar number (read only)"
+                    style={{ cursor: 'not-allowed', opacity: 0.7 }}
                   />
                 </div>
               </div>
@@ -367,7 +380,8 @@ export default function Header({ portal, setPortal, session, logout, changeGoogl
               </div>
             </form>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </header>
   );

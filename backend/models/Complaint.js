@@ -24,7 +24,27 @@ const ImageCheckSchema = new mongoose.Schema({
     type: Boolean,
     default: null,
   },
+  blocked: {
+    type: Boolean,
+    default: false,
+  },
   score: {
+    type: Number,
+    default: null,
+  },
+  classProbs: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
+  clipScores: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null,
+  },
+  clipSuggestion: {
+    type: String,
+    default: null,
+  },
+  clipOodScore: {
     type: Number,
     default: null,
   },
@@ -47,30 +67,45 @@ const ComplaintSchema = new mongoose.Schema({
   citizenName: {
     type: String,
     required: true,
+    maxlength: 200,
   },
   citizenPhone: {
     type: String,
     required: true,
+    maxlength: 20,
   },
   citizenLocation: {
     type: String,
     default: '',
+    maxlength: 500,
   },
   title: {
     type: String,
     required: true,
+    maxlength: 300,
   },
   type: {
     type: String,
     required: true,
+    maxlength: 100,
+    // Category drives ML routing (CATEGORY_TO_CLASS in server.js). Constrain to
+    // the known set so a typo can't silently skip validation / break routing.
+    enum: [
+      'Broken street light problem',
+      'Potholes',
+      'Drainage problem',
+      'Others',
+    ],
   },
   location: {
     type: String,
     required: true,
+    maxlength: 500,
   },
   description: {
     type: String,
     required: true,
+    maxlength: 5000,
   },
   status: {
     type: String,
@@ -88,6 +123,13 @@ const ComplaintSchema = new mongoose.Schema({
   images: {
     type: [String],
     default: [],
+    // Base64 images live inline in the BSON doc (16MB hard cap). At ~800x800
+    // JPEG q70 (~60-120KB each) a handful is fine, but an unbounded array can
+    // blow the document limit and hard-fail the save. Cap defensively.
+    validate: {
+      validator: arr => !Array.isArray(arr) || arr.length <= 6,
+      message: 'A complaint can have at most 6 images.',
+    },
   },
   updates: {
     type: [UpdateSchema],
@@ -118,5 +160,16 @@ const ComplaintSchema = new mongoose.Schema({
     default: false,
   },
 });
+
+// -----------------------------------------------------------------------------
+// Indexes — the common access patterns are: list sorted by updatedAt desc,
+// filter by status (stats), and point-lookups by the human-facing `id`.
+// Without these, each query is a full collection scan + in-memory sort, which
+// breaks past ~tens of thousands of docs (MongoDB's 32MB in-memory sort cap).
+// `id` already gets a unique index from the field definition above.
+// -----------------------------------------------------------------------------
+ComplaintSchema.index({ updatedAt: -1 });
+ComplaintSchema.index({ status: 1 });
+ComplaintSchema.index({ citizenPhone: 1 });
 
 module.exports = mongoose.model('Complaint', ComplaintSchema);

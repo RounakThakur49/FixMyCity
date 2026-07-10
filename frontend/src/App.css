@@ -5201,12 +5201,13 @@ textarea:focus-visible {
 
 .profile-edit-modal-container {
   width: 100%;
-  max-width: 440px;
-  background: #121824;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  max-width: 460px;
+  max-height: 90vh;
+  overflow-y: auto;
+  background: #FFFFFF;
+  border: 1px solid rgba(26, 36, 56, 0.1);
   border-radius: 12px;
-  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
-  overflow: hidden;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35);
   animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -5222,7 +5223,7 @@ textarea:focus-visible {
 
 .profile-edit-modal-header {
   padding: 20px 24px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid rgba(26, 36, 56, 0.08);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -5233,13 +5234,13 @@ textarea:focus-visible {
   font-family: 'Barlow', sans-serif;
   font-weight: 700;
   font-size: 1.125rem;
-  color: #F4EFE4;
+  color: #1A2438;
 }
 
 .profile-edit-modal-close {
   background: transparent;
   border: none;
-  color: rgba(255, 255, 255, 0.4);
+  color: rgba(26, 36, 56, 0.45);
   cursor: pointer;
   padding: 4px;
   border-radius: 4px;
@@ -5250,8 +5251,8 @@ textarea:focus-visible {
 }
 
 .profile-edit-modal-close:hover {
-  color: #F4EFE4;
-  background-color: rgba(255, 255, 255, 0.05);
+  color: #1A2438;
+  background-color: rgba(26, 36, 56, 0.06);
 }
 
 .profile-edit-modal-form {
@@ -5292,7 +5293,7 @@ textarea:focus-visible {
   font-size: 0.65rem;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: rgba(255, 255, 255, 0.45);
+  color: rgba(26, 36, 56, 0.55);
   margin-bottom: 8px;
 }
 
@@ -5305,16 +5306,16 @@ textarea:focus-visible {
 .profile-edit-input-icon {
   position: absolute;
   left: 14px;
-  color: rgba(255, 255, 255, 0.3);
+  color: rgba(26, 36, 56, 0.35);
 }
 
 .profile-edit-input-wrapper input {
   width: 100%;
   padding: 11px 14px 11px 40px;
-  background: #182030;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #F7F5EF;
+  border: 1px solid rgba(26, 36, 56, 0.12);
   border-radius: 6px;
-  color: #F4EFE4;
+  color: #1A2438;
   font-family: 'Barlow', sans-serif;
   font-size: 0.875rem;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
@@ -5322,8 +5323,8 @@ textarea:focus-visible {
 
 .profile-edit-input-wrapper input:focus {
   outline: none;
-  border-color: #F0E840;
-  box-shadow: 0 0 0 3px rgba(240, 232, 64, 0.12);
+  border-color: #E8590C;
+  box-shadow: 0 0 0 3px rgba(232, 89, 12, 0.12);
 }
 
 .profile-edit-actions {
@@ -5336,8 +5337,8 @@ textarea:focus-visible {
 
 .profile-edit-cancel-btn {
   background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.65);
+  border: 1px solid rgba(26, 36, 56, 0.2);
+  color: rgba(26, 36, 56, 0.7);
   font-family: 'Barlow', sans-serif;
   font-size: 0.85rem;
   font-weight: 600;
@@ -5348,14 +5349,14 @@ textarea:focus-visible {
 }
 
 .profile-edit-cancel-btn:hover {
-  background: rgba(255, 255, 255, 0.05);
-  color: #F4EFE4;
+  background: rgba(26, 36, 56, 0.05);
+  color: #1A2438;
 }
 
 .profile-edit-save-btn {
-  background: linear-gradient(135deg, #F0E840, #e5d400);
+  background: #E8590C;
   border: none;
-  color: #1A2438;
+  color: #FFFFFF;
   font-family: 'Barlow', sans-serif;
   font-size: 0.85rem;
   font-weight: 700;

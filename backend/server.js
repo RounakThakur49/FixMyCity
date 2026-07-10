@@ -1,826 +1,115 @@
+// =============================================================================
+// FixMyCity API — application bootstrap (modular, July 2026 refactor)
+// -----------------------------------------------------------------------------
+// This file is now a thin composition root. Concerns live in dedicated modules:
+//   config/db.js         — Mongo connect + boot seed
+//   middleware/security.js — helmet, cors, rate limiters
+//   middleware/auth.js   — JWT issue/verify, requireAuth/requireAdmin
+//   ml/pipeline.js       — NSFW + civic classifier + OOD + CLIP (all model state)
+//   routes/*.js          — auth, complaints, stats, reviews, health
+//   utils/               — datetime, aadhaar mask
+// Route paths are unchanged (full /api/... paths, mounted at '/') so the API
+// contract and the live frontend/Vercel deploy are byte-for-byte compatible.
+// =============================================================================
 const express = require('express');
 const mongoose = require('mongoose');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const path = require('path');
-const fs = require('fs');
-const tf = require('@tensorflow/tfjs');
-const nsfwjs = require('nsfwjs');
-const jpeg = require('jpeg-js');
 require('dotenv').config();
 
-const User = require('./models/User');
-const Admin = require('./models/Admin');
-const Complaint = require('./models/Complaint');
-const Review = require('./models/Review');
+const { connectDB } = require('./config/db');
+const {
+  helmetMiddleware, corsMiddleware, globalLimiter,
+} = require('./middleware/security');
+const ml = require('./ml/pipeline');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// =============================================================================
-// CONTENT MODERATION — nsfwjs adult/explicit content pre-screen
-// =============================================================================
+// ---- Global middleware (order matters: security → limiter → body parsers) ----
+app.use(helmetMiddleware);
+app.use(corsMiddleware);
+app.use('/api/', globalLimiter);
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-let nsfwModel = null;
-
-// NSFW categories returned by nsfwjs and their block thresholds
-const NSFW_RULES = [
-  { category: 'Porn',    threshold: 0.40 }, // explicit content
-  { category: 'Hentai',  threshold: 0.40 }, // animated adult content
-  { category: 'Sexy',    threshold: 0.70 }, // suggestive (higher bar)
-];
-
-async function loadNsfwModel() {
-  try {
-    console.log('[nsfw] Loading nsfwjs content moderation model...');
-    // nsfwjs loads its own model from the bundled path (no CDN needed after npm install)
-    nsfwModel = await nsfwjs.load();
-    console.log('[nsfw] Content moderation model ready.');
-  } catch (e) {
-    console.error('[nsfw] Failed to load nsfwjs model:', e.message);
-    console.warn('[nsfw] Adult content filtering DISABLED — submissions not pre-screened.');
-    nsfwModel = null;
-  }
-}
-
-async function checkNSFW(base64Str) {
-  if (!nsfwModel) return null;
-  let rawTensor = null;
-  try {
-    rawTensor = decodeImageToTensor(base64Str);
-    // nsfwjs expects a [H, W, 3] uint8 tensor
-    const uint8 = tf.tidy(() => rawTensor.toInt().clipByValue(0, 255));
-    const predictions = await nsfwModel.classify(uint8);
-    uint8.dispose();
-    // Convert array to map: { Porn: 0.02, Hentai: 0.01, Neutral: 0.95, Sexy: 0.01, Drawing: 0.01 }
-    const scores = {};
-    predictions.forEach(p => { scores[p.className] = parseFloat(p.probability.toFixed(4)); });
-
-    // Check each blocking rule
-    for (const rule of NSFW_RULES) {
-      const score = scores[rule.category] || 0;
-      if (score >= rule.threshold) {
-        return {
-          blocked: true,
-          category: rule.category,
-          score,
-          allScores: scores,
-          message: `Your image was flagged as potentially inappropriate (${rule.category}: ${(score * 100).toFixed(0)}%). Only photos of actual civic issues are allowed.`,
-        };
-      }
-    }
-    return { blocked: false, allScores: scores };
-  } catch (e) {
-    console.error('[nsfw] Inference error:', e.message);
-    return null; // fail open — never block due to NSFW model error
-  } finally {
-    if (rawTensor) tf.dispose(rawTensor);
-  }
-}
+// ---- Routes (each router declares its own full /api/... paths) ----
+app.use(require('./routes/health'));
+app.use(require('./routes/stats'));
+app.use(require('./routes/auth'));
+app.use(require('./routes/complaints'));
+app.use(require('./routes/reviews'));
 
 // =============================================================================
-// CIVIC IMAGE CLASSIFIER — Custom 4-class TFJS model (trained on civic data)
+// GLOBAL ERROR HANDLER
 // =============================================================================
-
-const CIVIC_CLASSES = ['drainage', 'others', 'potholes', 'streetlight'];
-
-// Maps the frontend complaint category string → our 4 model class names
-const CATEGORY_TO_CLASS = {
-  'Drainage problem':           'drainage',
-  'Potholes':                   'potholes',
-  'Broken street light problem':'streetlight',
-  'Others':                     'others',
-};
-
-// Per-class minimum confidence thresholds.
-// Loaded from civic_thresholds.json (generated by temperature_scaling.py).
-// These safe defaults are used when the JSON file doesn't exist yet.
-const DEFAULT_THRESHOLDS = {
-  drainage:    0.40,
-  others:      0.30,   // catch-all — most lenient
-  potholes:    0.45,
-  streetlight: 0.40,
-};
-
-let CLASS_THRESHOLDS = { ...DEFAULT_THRESHOLDS };
-let civicModel = null;
-
-// ---------------------------------------------------------------------------
-// Load civic_thresholds.json (calibrated per-class thresholds)
-// ---------------------------------------------------------------------------
-function loadThresholds() {
-  const thresholdsPath = path.join(__dirname, 'civic_thresholds.json');
-  try {
-    if (fs.existsSync(thresholdsPath)) {
-      const raw = JSON.parse(fs.readFileSync(thresholdsPath, 'utf8'));
-      // civic_thresholds.json may have structure { thresholds: {...} } or just { class: value }
-      const thresholds = raw.thresholds || raw;
-      CLASS_THRESHOLDS = { ...DEFAULT_THRESHOLDS, ...thresholds };
-      console.log('[civic] Loaded calibrated thresholds:', CLASS_THRESHOLDS);
-    } else {
-      console.warn('[civic] civic_thresholds.json not found — using safe defaults.');
-      console.warn('        Run: python temperature_scaling.py (after retraining)');
-    }
-  } catch (e) {
-    console.error('[civic] Failed to load thresholds, using defaults:', e.message);
+// Terminal error middleware — keeps the API's JSON contract for failures that
+// bypass the per-route try/catch, most notably body-parser errors (malformed
+// JSON → 400, over-limit payload → 413) which otherwise return Express's
+// default HTML 500.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ message: 'Payload too large. Please upload a smaller image.' });
   }
-}
-
-// ---------------------------------------------------------------------------
-// Custom filesystem IOHandler — reads model.json + .bin shards from disk
-// Works with @tensorflow/tfjs (browser build) in Node.js (no tfjs-node needed)
-// ---------------------------------------------------------------------------
-function makeFileSystemHandler(modelDir) {
-  return {
-    load: async () => {
-      const modelJsonPath = path.join(modelDir, 'model.json');
-      const modelJson = JSON.parse(fs.readFileSync(modelJsonPath, 'utf8'));
-
-      // Collect all weight shard paths from the manifest
-      const manifest = modelJson.weightsManifest || [];
-      const shardPaths = manifest.flatMap(m => m.paths || []);
-
-      // Concatenate all shard buffers into a single ArrayBuffer
-      const shardBuffers = shardPaths.map(p =>
-        fs.readFileSync(path.join(modelDir, p))
-      );
-      const totalBytes = shardBuffers.reduce((acc, b) => acc + b.length, 0);
-      const combined = Buffer.concat(shardBuffers, totalBytes);
-
-      const weightSpecs = manifest.flatMap(m => m.weights || []);
-
-      return {
-        modelTopology: modelJson.modelTopology,
-        weightSpecs,
-        weightData: combined.buffer.slice(
-          combined.byteOffset,
-          combined.byteOffset + combined.byteLength
-        ),
-        format: modelJson.format,
-        generatedBy: modelJson.generatedBy,
-        convertedBy: modelJson.convertedBy,
-        signature: modelJson.signature,
-        userDefinedMetadata: modelJson.userDefinedMetadata,
-      };
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Load the custom TFJS 4-class civic model
-// ---------------------------------------------------------------------------
-async function loadCivicModel() {
-  const modelDir = path.join(__dirname, 'civic_model_tfjs');
-  const modelJsonPath = path.join(modelDir, 'model.json');
-
-  if (!fs.existsSync(modelJsonPath)) {
-    console.error('[civic] civic_model_tfjs/model.json not found.');
-    console.error('        Run: python train_civic_model.py  — to train and export the model.');
-    console.warn('[civic] Image validation will be SKIPPED until model is available.');
-    return;
+  if (err && (err.type === 'entity.parse.failed' || err instanceof SyntaxError)) {
+    return res.status(400).json({ message: 'Malformed request body.' });
   }
-
-  try {
-    console.log('[civic] Loading custom 4-class civic layers model from civic_model_tfjs/...');
-    const ioHandler = makeFileSystemHandler(modelDir);
-    civicModel = await tf.loadLayersModel(ioHandler);
-    // Warm up with a dummy tensor
-    const dummy = tf.zeros([1, 224, 224, 3]);
-    const warmup = civicModel.predict(dummy);
-    if (warmup && typeof warmup.dispose === 'function') warmup.dispose();
-    else if (Array.isArray(warmup)) warmup.forEach(t => t.dispose && t.dispose());
-    dummy.dispose();
-    console.log('[civic] Civic graph model loaded. Classes:', CIVIC_CLASSES);
-    console.log('[civic] Thresholds:', CLASS_THRESHOLDS);
-  } catch (e) {
-    console.error('[civic] Failed to load civic model:', e.message);
-    console.warn('[civic] Image validation will be SKIPPED until model is fixed.');
-    civicModel = null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Image decoding — supports JPEG and PNG (via raw pixel extraction)
-// ---------------------------------------------------------------------------
-function decodeImageToTensor(base64Str) {
-  // Strip data URI prefix (data:image/jpeg;base64, or data:image/png;base64,)
-  const base64Data = base64Str.replace(/^data:image\/\w+;base64,/, '');
-  const buffer = Buffer.from(base64Data, 'base64');
-
-  // Detect format from magic bytes
-  const isPng = buffer[0] === 0x89 && buffer[1] === 0x50; // PNG magic bytes
-
-  let rawPixels, width, height;
-
-  if (isPng) {
-    // Use tfjs built-in PNG decode via browser-compatible tensor
-    // Fallback: try to use a simple RGBA→RGB extraction if jpeg-js fails
-    try {
-      // Try jpeg-js anyway (some PNG-labelled files are JPEG)
-      const raw = jpeg.decode(buffer, { useTArray: true });
-      width = raw.width;
-      height = raw.height;
-      const numPixels = width * height;
-      rawPixels = new Uint8Array(numPixels * 3);
-      for (let i = 0; i < numPixels; i++) {
-        rawPixels[i * 3]     = raw.data[i * 4];
-        rawPixels[i * 3 + 1] = raw.data[i * 4 + 1];
-        rawPixels[i * 3 + 2] = raw.data[i * 4 + 2];
-      }
-    } catch {
-      throw new Error('PNG decoding requires @tensorflow/tfjs-node or sharp. Upload JPEG images.');
-    }
-  } else {
-    // JPEG
-    const raw = jpeg.decode(buffer, { useTArray: true });
-    width = raw.width;
-    height = raw.height;
-    const numPixels = width * height;
-    rawPixels = new Uint8Array(numPixels * 3);
-    for (let i = 0; i < numPixels; i++) {
-      rawPixels[i * 3]     = raw.data[i * 4];
-      rawPixels[i * 3 + 1] = raw.data[i * 4 + 1];
-      rawPixels[i * 3 + 2] = raw.data[i * 4 + 2];
-    }
-  }
-
-  return tf.tensor3d(rawPixels, [height, width, 3]);
-}
-
-// ---------------------------------------------------------------------------
-// MobileNetV2 preprocessing: [0, 255] → [-1, 1]
-// ---------------------------------------------------------------------------
-function preprocessForCivicModel(imageTensor) {
-  return tf.tidy(() => {
-    // Resize to 224×224
-    const resized = tf.image.resizeBilinear(imageTensor, [224, 224]);
-    // MobileNetV2 preprocess_input: x / 127.5 - 1
-    const floated = resized.toFloat();
-    const scaled = floated.div(127.5).sub(1.0);
-    return scaled.expandDims(0); // [1, 224, 224, 3]
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Run image through our civic model and get class probabilities
-// ---------------------------------------------------------------------------
-async function classifyCivicImage(base64Str) {
-  if (!civicModel) return null;
-
-  let rawTensor = null;
-  let inputTensor = null;
-  let predTensor = null;
-
-  try {
-    rawTensor = decodeImageToTensor(base64Str);
-    inputTensor = preprocessForCivicModel(rawTensor);
-    // graph model .predict() returns a tensor or array of tensors
-    const output = civicModel.predict(inputTensor);
-    predTensor = Array.isArray(output) ? output[0] : output;
-    const probabilities = await predTensor.data();
-
-    // Build result object with class -> probability mapping
-    const result = {};
-    CIVIC_CLASSES.forEach((cls, i) => {
-      result[cls] = parseFloat(probabilities[i].toFixed(4));
-    });
-    return result;
-  } finally {
-    // Always dispose tensors to prevent memory leaks
-    if (rawTensor) tf.dispose(rawTensor);
-    if (inputTensor) tf.dispose(inputTensor);
-    if (predTensor) tf.dispose(predTensor);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Core decision logic: should we block this submission?
-// ---------------------------------------------------------------------------
-function decideBlock(classProbs, declaredCategory) {
-  const declaredClass = CATEGORY_TO_CLASS[declaredCategory];
-  if (!declaredClass) {
-    return { block: false, reason: 'unknown_category' };
-  }
-
-  const declaredProb = classProbs[declaredClass] || 0;
-  const threshold = CLASS_THRESHOLDS[declaredClass] || DEFAULT_THRESHOLDS[declaredClass] || 0.35;
-
-  // Find the highest confidence class
-  let topClass = null;
-  let topProb = 0;
-  for (const [cls, prob] of Object.entries(classProbs)) {
-    if (prob > topProb) {
-      topProb = prob;
-      topClass = cls;
-    }
-  }
-
-  // RULE 1: Declared class confidence is too low → block
-  if (declaredProb < threshold) {
-    return {
-      block: true,
-      reason: 'low_confidence',
-      declaredClass,
-      declaredProb,
-      threshold,
-      topClass,
-      topProb,
-      message: `The uploaded image does not appear to match the selected category "${declaredCategory}" (confidence: ${(declaredProb * 100).toFixed(0)}%, required: ${(threshold * 100).toFixed(0)}%). Please upload a photo that clearly shows the issue.`,
-      suggestion: topClass !== declaredClass
-        ? `The image appears to show a "${topClass}" issue instead (${(topProb * 100).toFixed(0)}% confidence).`
-        : 'Please upload a clearer photo of the actual issue.',
-    };
-  }
-
-  // RULE 2: A different class has significantly higher confidence → block
-  // (e.g., citizen submits "Potholes" but image is clearly a streetlight)
-  if (topClass !== declaredClass && topProb > declaredProb + 0.20) {
-    return {
-      block: true,
-      reason: 'category_mismatch',
-      declaredClass,
-      declaredProb,
-      topClass,
-      topProb,
-      message: `The uploaded image appears to show a "${topClass}" issue (${(topProb * 100).toFixed(0)}%), not "${declaredCategory}" (${(declaredProb * 100).toFixed(0)}%). Please select the correct category or upload a matching photo.`,
-      suggestion: `Consider reporting this as a "${topClass}" issue instead.`,
-    };
-  }
-
-  // All checks passed — accept the submission
-  return {
-    block: false,
-    reason: 'accepted',
-    declaredClass,
-    declaredProb,
-    threshold,
-    topClass,
-    topProb,
-  };
-}
-
-// =============================================================================
-// MIDDLEWARE
-// =============================================================================
-
-app.use(cors());
-app.use('/model', express.static(path.join(__dirname, 'civic_model_tfjs')));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-const getFormattedDate = () => {
-  try {
-    const opts = {
-      timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', hour12: false,
-    };
-    return new Intl.DateTimeFormat('en-CA', opts).format(new Date()).replace(',', '');
-  } catch (e) {
-    return new Date().toISOString().replace('T', ' ').substring(0, 16);
-  }
-};
-
-// =============================================================================
-// HEALTH CHECK
-// =============================================================================
-
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    model_loaded: !!civicModel,
-    nsfw_loaded: !!nsfwModel,
-    classes: CIVIC_CLASSES,
-    thresholds: CLASS_THRESHOLDS,
-    classifier: civicModel
-      ? 'custom-civic-4class-tfjs (enforce mode)'
-      : 'no model loaded — submissions not validated',
-    content_moderation: nsfwModel
-      ? 'nsfwjs active (Porn/Hentai >40%, Sexy >70% blocked)'
-      : 'disabled',
-  });
-});
-
-// =============================================================================
-// DATABASE CONNECTION + SEED
-// =============================================================================
-
-mongoose.connect(process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/FixMyCity')
-  .then(async () => {
-    console.log('Connected to MongoDB.');
-    await seedDatabase();
-  })
-  .catch(err => console.error('MongoDB connection error:', err));
-
-async function seedDatabase() {
-  try {
-    if ((await Admin.countDocuments()) === 0) {
-      const hash = await bcrypt.hash('rounak123', 10);
-      await new Admin({ name: 'City Admin', username: 'admin@fixmycity', password: hash, role: 'admin' }).save();
-      console.log('Admin seeded.');
-    }
-    if ((await User.countDocuments()) === 0) {
-      const hash = await bcrypt.hash('citizen123', 10);
-      await User.insertMany([
-        { name: 'Aarav Sen', phone: '9876543210', aadhar: '123412341234', password: hash, role: 'citizen' },
-        { name: 'Diya Kapoor', phone: '9123456780', aadhar: '987698769876', password: hash, role: 'citizen' },
-      ]);
-      console.log('Citizens seeded.');
-    }
-    if ((await Complaint.countDocuments()) === 0) {
-      await Complaint.insertMany([
-        {
-          id: 'CMP-2401', citizenName: 'Aarav Sen', citizenPhone: '9876543210',
-          title: 'Large potholes near market road', type: 'Potholes',
-          location: 'MG Road, near City Market Gate 2',
-          citizenLocation: 'Flat 402, Block A, Green Meadows, Bangalore',
-          description: 'Two deep potholes are causing traffic jams and bike skids during evening hours.',
-          status: 'In Review', forwardedTo: 'Road Maintenance Cell',
-          updatedAt: '2026-06-08 10:30', createdAt: '2026-06-07 18:45',
-          latitude: 12.9748, longitude: 77.6087,
-          image: 'https://images.unsplash.com/photo-1518391846015-55a9cc003b25?auto=format&fit=crop&w=900&q=80',
-          images: ['https://images.unsplash.com/photo-1518391846015-55a9cc003b25?auto=format&fit=crop&w=900&q=80'],
-          updates: [
-            { label: 'Submitted', note: 'Complaint registered by citizen.', at: '2026-06-07 18:45' },
-            { label: 'In Review', note: 'Area inspection requested by admin.', at: '2026-06-08 10:30' },
-          ],
-        },
-        {
-          id: 'CMP-2402', citizenName: 'Diya Kapoor', citizenPhone: '9123456780',
-          title: 'Overflowing roadside drain', type: 'Drainage problem',
-          location: 'Lake View Colony, Block B',
-          citizenLocation: 'Villa 12, Lake View Colony, Bangalore',
-          description: 'Drain water is overflowing onto the road and creating a strong smell near the school entrance.',
-          status: 'Forwarded', forwardedTo: 'Drainage and Sanitation Department',
-          updatedAt: '2026-06-08 09:10', createdAt: '2026-06-06 14:20',
-          latitude: 12.9848, longitude: 77.6187,
-          image: 'https://images.unsplash.com/photo-1527482797697-8795b05a13fe?auto=format&fit=crop&w=900&q=80',
-          images: ['https://images.unsplash.com/photo-1527482797697-8795b05a13fe?auto=format&fit=crop&w=900&q=80'],
-          updates: [
-            { label: 'Submitted', note: 'Complaint registered by citizen.', at: '2026-06-06 14:20' },
-            { label: 'In Review', note: 'Ward office reviewed the complaint.', at: '2026-06-07 11:00' },
-            { label: 'Forwarded', note: 'Issue forwarded to Drainage and Sanitation Department.', at: '2026-06-08 09:10' },
-          ],
-        },
-      ]);
-      console.log('Complaints seeded.');
-    }
-
-    const reviewCount = await Review.countDocuments();
-    if (reviewCount === 0) {
-      console.log('Seeding initial website reviews...');
-      await Review.insertMany([
-        {
-          name: 'Maria Chen', role: 'Resident, Portland',
-          quote: 'Reported a pothole on my street Monday morning. By Thursday it was filled. I was genuinely shocked at how fast it worked.',
-          avatar: 'MC', rating: 5
-        },
-        {
-          name: 'David Okafor', role: 'Community Organizer, Austin',
-          quote: 'FixMyCity turned our neighborhood association into a real force. We documented 40 broken streetlights in one evening. All fixed within a month.',
-          avatar: 'DO', rating: 5
-        },
-        {
-          name: 'Rosa Medina', role: 'City Council Aide, Denver',
-          quote: 'From the government side — the prioritized reports make our job so much easier. We see what matters most to residents instantly.',
-          avatar: 'RM', rating: 5
-        }
-      ]);
-      console.log('Reviews seeded successfully.');
-    }
-  } catch (error) {
-    console.error('Error seeding database:', error);
-  }
-}
-
-// =============================================================================
-// AUTH ROUTES
-// =============================================================================
-
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { name, phone, aadhar, email, password } = req.body;
-    if (!name || !phone || !aadhar || !password) {
-      return res.status(400).json({ message: 'All registration fields are required.' });
-    }
-    if (!/^\d{12}$/.test(aadhar)) {
-      return res.status(400).json({ message: 'Aadhar number must be exactly 12 digits.' });
-    }
-    const existingPhone = await User.findOne({ phone });
-    if (existingPhone) {
-      return res.status(400).json({ message: 'Mobile number already registered.' });
-    }
-    if (await User.findOne({ aadhar })) {
-      return res.status(400).json({ message: 'Aadhar number already registered.' });
-    }
-    const hash = await bcrypt.hash(password, 10);
-    const u = new User({ name, phone, aadhar, email: email || '', password: hash, role: 'citizen' });
-    await u.save();
-    res.status(201).json({
-      message: 'Citizen registered successfully.',
-      user: { id: u._id, name: u.name, phone: u.phone, aadhar: u.aadhar, email: u.email || '', role: u.role },
-    });
-  } catch (e) {
-    console.error('Registration error:', e);
-    res.status(500).json({ message: 'Internal server error during registration.' });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { password } = req.body;
-    const identifier = req.body.identifier || req.body.phone;
-    if (!identifier || !password) {
-      return res.status(400).json({ message: 'Mobile number/ID and password are required.' });
-    }
-    let user = await Admin.findOne({ username: identifier });
-    if (!user) user = await User.findOne({ phone: identifier });
-    if (!user) return res.status(404).json({ message: 'User not found' });
-    if (!(await bcrypt.compare(password, user.password))) {
-      return res.status(400).json({ message: 'Incorrect password' });
-    }
-    res.status(200).json({
-      message: 'Logged in successfully.',
-      user: {
-        id: user._id, name: user.name, phone: user.phone || '', username: user.username || '',
-        aadhar: user.aadhar || '', email: user.email || '', role: user.role,
-      },
-    });
-  } catch (e) {
-    console.error('Login error:', e);
-    res.status(500).json({ message: 'Internal server error during login.' });
-  }
-});
-
-// =============================================================================
-// STATS ROUTE
-// =============================================================================
-
-app.get('/api/stats', async (req, res) => {
-  try {
-    const totalComplaints = await Complaint.countDocuments();
-    const resolvedComplaints = await Complaint.countDocuments({ status: 'Resolved' });
-    const registeredCitizens = await User.countDocuments({ role: 'citizen' });
-    res.status(200).json({ totalComplaints, resolvedComplaints, registeredCitizens });
-  } catch (e) {
-    console.error('Get stats error:', e);
-    res.status(500).json({ message: 'Failed to retrieve stats.' });
-  }
-});
-
-// =============================================================================
-// COMPLAINT ROUTES
-// =============================================================================
-
-app.get('/api/complaints', async (req, res) => {
-  try {
-    const complaints = await Complaint.find().sort({ updatedAt: -1 });
-    res.status(200).json(complaints);
-  } catch (e) {
-    console.error('Get complaints error:', e);
-    res.status(500).json({ message: 'Failed to retrieve complaints.' });
-  }
-});
-
-app.post('/api/complaints', async (req, res) => {
-  try {
-    const {
-      citizenName, citizenPhone, citizenLocation,
-      title, type, location, description,
-      images, image, latitude, longitude
-    } = req.body;
-
-    if (!citizenName || !citizenPhone || !title || !type || !location || !description) {
-      return res.status(400).json({ message: 'Required fields are missing.' });
-    }
-
-    const activeImage = image || (images && images[0]);
-    const isBase64 = activeImage && activeImage.startsWith('data:image/');
-
-    let imageCheck = {
-      model: 'none',
-      matched: null,
-      blocked: false,
-      score: null,
-      classProbs: null,
-      note: 'Image not checked.',
-      at: getFormattedDate(),
-    };
-
-    // -------------------------------------------------------------------------
-    // STEP 1 — Content moderation: block adult/explicit/inappropriate images
-    // -------------------------------------------------------------------------
-    if (isBase64) {
-      try {
-        const nsfwResult = await checkNSFW(activeImage);
-        if (nsfwResult && nsfwResult.blocked) {
-          console.warn(`[nsfw] BLOCKED upload: ${nsfwResult.category} (${(nsfwResult.score * 100).toFixed(0)}%)`);
-          return res.status(422).json({
-            blocked: true,
-            reason: 'inappropriate_content',
-            message: nsfwResult.message,
-            suggestion: 'Please upload a clear photo of the civic issue you are reporting.',
-            nsfwDetails: {
-              flaggedCategory: nsfwResult.category,
-              confidence: parseFloat((nsfwResult.score * 100).toFixed(1)),
-              allScores: nsfwResult.allScores,
-            },
-          });
-        }
-      } catch (e) {
-        console.error('[nsfw] Pre-screen error — continuing:', e.message);
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // STEP 2 — Image validation — only for base64 uploads from citizens
-    // -------------------------------------------------------------------------
-    if (isBase64 && CATEGORY_TO_CLASS[type]) {
-      if (!civicModel) {
-        // Model not loaded — log and allow (never block citizens due to ML failure)
-        imageCheck.note = 'AI validation unavailable — model not loaded. Submission accepted.';
-        console.warn('[civic] Model not loaded — skipping image validation for', type);
-      } else {
-        try {
-          const classProbs = await classifyCivicImage(activeImage);
-
-          if (!classProbs) {
-            imageCheck.note = 'AI validation returned no result — submission accepted.';
-          } else {
-            let validationType = type;
-            if (type === 'Others') {
-              const t = title.toLowerCase();
-              if (t.includes('pothole') || t.includes('road')) validationType = 'Potholes';
-              else if (t.includes('drain') || t.includes('water') || t.includes('flood') || t.includes('sewage')) validationType = 'Drainage problem';
-              else if (t.includes('light') || t.includes('lamp') || t.includes('pole')) validationType = 'Broken street light problem';
-            }
-            const decision = decideBlock(classProbs, validationType);
-
-            const probsStr = Object.entries(classProbs)
-              .sort(([, a], [, b]) => b - a)
-              .map(([cls, p]) => `${cls}:${(p * 100).toFixed(0)}%`)
-              .join(', ');
-
-            console.log(
-              `[civic] declared="${type}" class="${decision.declaredClass}" ` +
-              `declared_prob=${(decision.declaredProb * 100).toFixed(0)}% ` +
-              `threshold=${(decision.threshold || 0) * 100 || '?'}% ` +
-              `top="${decision.topClass}" top_prob=${(decision.topProb * 100).toFixed(0)}% ` +
-              `→ ${decision.block ? '❌ BLOCK' : '✅ ACCEPT'} (${decision.reason})`
-            );
-
-            imageCheck = {
-              model: 'custom-civic-4class-tfjs',
-              matched: !decision.block,
-              blocked: decision.block,
-              score: decision.declaredProb,
-              classProbs,
-              note: decision.block ? decision.message : `✅ Image matches "${type}" (${(decision.declaredProb * 100).toFixed(0)}% confidence).`,
-              at: getFormattedDate(),
-            };
-
-            // Block the submission — return 422 with user-friendly message
-            if (decision.block) {
-              return res.status(422).json({
-                blocked: true,
-                message: decision.message,
-                suggestion: decision.suggestion || '',
-                aiDetails: {
-                  declaredCategory: type,
-                  declaredClass: decision.declaredClass,
-                  declaredConfidence: parseFloat((decision.declaredProb * 100).toFixed(1)),
-                  topClass: decision.topClass,
-                  topConfidence: parseFloat((decision.topProb * 100).toFixed(1)),
-                  allScores: classProbs,
-                  reason: decision.reason,
-                },
-              });
-            }
-          }
-        } catch (inferenceErr) {
-          // Inference error — log but NEVER block the citizen
-          console.error('[civic] Inference error — allowing submission:', inferenceErr.message);
-          imageCheck.note = 'AI validation error — submission accepted without check.';
-        }
-      }
-    } else if (!isBase64) {
-      imageCheck.note = 'URL or seed image — AI validation skipped.';
-    } else if (!CATEGORY_TO_CLASS[type]) {
-      imageCheck.note = `Unknown complaint type "${type}" — AI validation skipped.`;
-    }
-
-    // -------------------------------------------------------------------------
-    // Create and save the complaint
-    // -------------------------------------------------------------------------
-    const count = await Complaint.countDocuments();
-    let serial = 2401 + count;
-    let complaintId = `CMP-${serial}`;
-    while (await Complaint.findOne({ id: complaintId })) {
-      serial++;
-      complaintId = `CMP-${serial}`;
-    }
-
-    const timestamp = getFormattedDate();
-    const newComplaint = new Complaint({
-      id: complaintId, citizenName, citizenPhone,
-      citizenLocation: citizenLocation || '',
-      title, type, location, description,
-      status: 'Submitted', forwardedTo: '',
-      image: image || '', images: images || [],
-      updates: [{ label: 'Submitted', note: 'Complaint registered by citizen.', at: timestamp }],
-      imageCheck,
-      createdAt: timestamp, updatedAt: timestamp,
-      latitude: latitude || null,
-      longitude: longitude || null,
-    });
-    await newComplaint.save();
-    res.status(201).json(newComplaint);
-
-  } catch (e) {
-    console.error('Create complaint error:', e);
-    res.status(500).json({ message: 'Failed to submit complaint.' });
-  }
-});
-
-app.patch('/api/complaints/:id/status', async (req, res) => {
-  try {
-    const { status, forwardedTo } = req.body;
-    if (!status) return res.status(400).json({ message: 'Status field is required.' });
-
-    const complaint = await Complaint.findOne({ id: req.params.id });
-    if (!complaint) return res.status(404).json({ message: 'Complaint not found.' });
-
-    const timestamp = getFormattedDate();
-    let note = '';
-    switch (status) {
-      case 'In Review': note = 'Area inspection requested by admin.'; break;
-      case 'Forwarded': note = `Issue forwarded to ${forwardedTo || 'respective department'}.`; break;
-      case 'Resolved':  note = 'Complaint resolved successfully.'; break;
-      default:          note = `Status updated to ${status}.`;
-    }
-
-    complaint.status = status;
-    if (forwardedTo !== undefined && forwardedTo !== '') complaint.forwardedTo = forwardedTo;
-    complaint.updatedAt = timestamp;
-    complaint.updates.push({ label: status, note, at: timestamp });
-    await complaint.save();
-    res.status(200).json(complaint);
-  } catch (e) {
-    console.error('Update status error:', e);
-    res.status(500).json({ message: 'Failed to update complaint status.' });
-  }
-});
-
-app.delete('/api/complaints/:id', async (req, res) => {
-  try {
-    const r = await Complaint.findOneAndDelete({ id: req.params.id });
-    if (!r) return res.status(404).json({ message: 'Complaint not found.' });
-    res.status(200).json({ message: 'Complaint deleted successfully.', id: req.params.id });
-  } catch (e) {
-    console.error('Delete complaint error:', e);
-    res.status(500).json({ message: 'Failed to delete complaint.' });
-  }
-});
-
-// =============================================================================
-// WEBSITE REVIEW ROUTES
-// =============================================================================
-
-app.post('/api/reviews', async (req, res) => {
-  try {
-    const { name, role, quote, rating, complaintId } = req.body;
-    if (!name || !role || !quote || !rating) {
-      return res.status(400).json({ message: 'All review fields (name, role, quote, rating) are required.' });
-    }
-    const initials = name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() || 'U';
-    const newReview = new Review({ name, role, quote, avatar: initials, rating: Number(rating), complaintId: complaintId || '' });
-    await newReview.save();
-    if (complaintId) {
-      await Complaint.findOneAndUpdate({ id: complaintId }, { isReviewed: true });
-    }
-    res.status(201).json(newReview);
-  } catch (error) {
-    console.error('Submit review error:', error);
-    res.status(500).json({ message: 'Failed to submit review.' });
-  }
-});
-
-app.get('/api/reviews', async (req, res) => {
-  try {
-    const reviews = await Review.find().sort({ createdAt: -1 });
-    res.status(200).json(reviews);
-  } catch (error) {
-    console.error('Get reviews error:', error);
-    res.status(500).json({ message: 'Failed to retrieve reviews.' });
-  }
+  console.error('Unhandled request error:', err);
+  res.status(500).json({ message: 'Internal server error.' });
 });
 
 // =============================================================================
 // START SERVER
 // =============================================================================
+connectDB().catch(err => console.error('MongoDB connection error:', err));
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Express server running on port ${PORT}`);
-  loadThresholds();
-  loadNsfwModel();
-  loadCivicModel();
+  // Load all ML models (thresholds → nsfw → civic → CLIP). Non-blocking and
+  // fail-open — boot never crashes if any model is unavailable.
+  ml.loadAll()
+    .then(({ clipReady }) => {
+      console.log(`[clip] Others open-set classifier ${clipReady ? 'ready.' : 'DISABLED (keyword fallback only).'}`);
+    })
+    .catch(e => console.error('[ml] Model load error (continuing, fail-open):', e.message));
+});
+
+// =============================================================================
+// GRACEFUL SHUTDOWN + PROCESS SAFETY NETS
+// =============================================================================
+// Stop accepting new connections, drain in-flight requests, then close the DB
+// connection before exiting. Without this, a deploy/restart severs in-flight
+// writes and churns the Mongoose pool.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} received — closing server...`);
+  const forceExit = setTimeout(() => {
+    console.error('[shutdown] Forced exit after 10s drain timeout.');
+    process.exit(1);
+  }, 10000);
+  forceExit.unref();
+  server.close(async () => {
+    try {
+      await mongoose.connection.close(false);
+      console.log('[shutdown] MongoDB connection closed. Bye.');
+    } catch (e) {
+      console.error('[shutdown] Error closing MongoDB connection:', e.message);
+    } finally {
+      clearTimeout(forceExit);
+      process.exit(0);
+    }
+  });
+}
+
+['SIGTERM', 'SIGINT'].forEach(sig => process.on(sig, () => gracefulShutdown(sig)));
+
+// Last-resort logging so an unexpected rejection/exception is visible rather
+// than silently terminating the process on newer Node versions.
+process.on('unhandledRejection', reason => {
+  console.error('[process] Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', err => {
+  console.error('[process] Uncaught exception:', err);
 });

@@ -60,6 +60,10 @@ export default function Timeline({ updates }) {
       {updates.map((update, index) => {
         const config = getStatusConfig(update.label);
         const Icon = config.icon;
+        // Only the latest (current) status dot pulses — a single "live" cue.
+        // Previously every dot ran an infinite animation, draining CPU/battery
+        // on low-end citizen devices (N perpetual loops per open complaint).
+        const isCurrent = index === updates.length - 1;
 
         return (
           <motion.div
@@ -70,13 +74,12 @@ export default function Timeline({ updates }) {
             <div className="timeline-dot-container-new">
               <motion.div
                 className="timeline-dot-outer-glow-new"
-                animate={{ scale: [1, 1.15, 1], opacity: [0.6, 1, 0.6] }}
-                transition={{
+                animate={isCurrent ? { scale: [1, 1.15, 1], opacity: [0.6, 1, 0.6] } : { scale: 1, opacity: 0.6 }}
+                transition={isCurrent ? {
                   duration: 2.5,
                   repeat: Infinity,
                   ease: 'easeInOut',
-                  delay: index * 0.4,
-                }}
+                } : { duration: 0 }}
                 style={{
                   boxShadow: `0 0 12px ${config.dotBg}60`,
                   borderColor: `${config.dotBg}30`,

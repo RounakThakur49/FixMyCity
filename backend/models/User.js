@@ -21,13 +21,18 @@ const UserSchema = new mongoose.Schema({
   email: {
     type: String,
     trim: true,
+    maxlength: 200,
   },
   password: {
     type: String,
     required: true,
+    // Never ship the bcrypt hash in a query result by default. Routes that need
+    // it for comparison must opt in with .select('+password').
+    select: false,
   },
   role: {
     type: String,
+    enum: ['citizen', 'admin'],
     default: 'citizen',
   },
 }, {

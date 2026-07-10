@@ -327,30 +327,33 @@ export default function GoogleMap({
           markerRef.current.setPosition(latLng);
         }
 
-        if (isLoaded) {
-          const maps = window.google.maps;
-          const geocoder = new maps.Geocoder();
+        // Propagate the raw GPS fix to the parent IMMEDIATELY and unconditionally.
+        // Address reverse-geocoding is best-effort and only works once the Maps
+        // SDK has loaded — but the coordinates themselves must always reach state
+        // (previously they were trapped inside `if (isLoaded)`, so a missing/invalid
+        // Maps API key meant live location was captured but never stored).
+        const fallbackAddr = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+        const emit = (addr) => {
+          if (onChangeLocation) {
+            onChangeLocation({ latitude: lat, longitude: lng, address: addr || fallbackAddr });
+          }
+        };
+
+        if (isLoaded && window.google?.maps) {
+          const geocoder = new window.google.maps.Geocoder();
           geocoder.geocode({ location: latLng }, (results, status) => {
-            let geocodedAddress = '';
-            if (status === 'OK' && results[0]) {
-              geocodedAddress = results[0].formatted_address;
-            }
-            if (onChangeLocation) {
-              onChangeLocation({
-                latitude: lat,
-                longitude: lng,
-                address: geocodedAddress || `${lat.toFixed(6)}, ${lng.toFixed(6)}`
-              });
-            }
+            emit(status === 'OK' && results[0] ? results[0].formatted_address : fallbackAddr);
           });
+        } else {
+          emit(fallbackAddr);
         }
       },
       (error) => {
         setGeolocating(false);
         console.error("Error geolocating user:", error);
-        alert("Failed to retrieve your location. Please check browser permissions.");
+        alert("Failed to retrieve your location. Please check browser location permissions and try again.");
       },
-      { enableHighAccuracy: true, timeout: 5000 }
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
   };
 
