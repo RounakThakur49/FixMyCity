@@ -26,6 +26,9 @@ backend/__pycache__/
 **/__pycache__/
 *.pyc
 
+# CLIP model download cache (@xenova/transformers + build_others_exemplars.py)
+backend/.cache/
+
 # Training dataset (large; bring your own per README)
 backend/my_dataset/
 backend/my_dataset_excess/

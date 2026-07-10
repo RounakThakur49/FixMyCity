@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const Admin = require('../models/Admin');
 const User = require('../models/User');
 const Complaint = require('../models/Complaint');
+const Review = require('../models/Review');
 
 async function seedDatabase() {
   try {
