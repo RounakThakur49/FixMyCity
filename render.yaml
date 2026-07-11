@@ -27,7 +27,15 @@ services:
     plan: free
     buildCommand: cd backend && npm install && cd ../ml-service && npm install --omit=dev
     startCommand: cd backend && npm start
-    healthCheckPath: /api/health
+    # NO healthCheckPath ON PURPOSE. Render's HTTP health check has a fixed ~5s
+    # timeout. Pure-JS tfjs civic inference is SYNCHRONOUS and blocks the single
+    # 0.1-CPU event loop for 25-60s per photo — during that block /api/health
+    # can't respond in 5s, so Render marks the instance unhealthy and restarts it
+    # MID-INFERENCE → crashloop (502) + failed citizen submissions. Without a
+    # healthCheckPath Render falls back to TCP port-bind liveness: the port binds
+    # instantly in app.listen (before ML load) and stays bound through inference,
+    # so the persistent process is never killed for a slow HTTP response. This
+    # matches the "persistent process → no per-request timeout" design above.
     envVars:
       - key: NODE_VERSION
         value: "20"
