@@ -32,9 +32,10 @@ services:
       - key: NODE_VERSION
         value: "20"
       - key: NODE_OPTIONS
-        value: "--max-old-space-size=460"   # raise V8 heap ceiling; Render's
-        # low default aborts (exit 134) during tfjs model load even though real
-        # RSS peaks ~280MB. 460 leaves headroom under the 512MB container cap.
+        value: "--max-old-space-size=400"   # tuned for 512MB container. Pure-JS
+        # tfjs keeps tensors IN the V8 heap, so heap+baseline must stay < 512.
+        # 460 tipped over (container OOM); ~256 (Node default on 512MB cgroup)
+        # aborts mid-load (heap OOM 134). 400 loads AND fits with headroom.
       - key: ML_INLINE
         value: "true"          # run ML in-process (single free service)
       - key: DISABLE_CLIP

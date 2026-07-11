@@ -738,7 +738,14 @@ function decideBlock(classProbs, declaredCategory, opts = {}) {
 // =============================================================================
 async function loadAll() {
   loadThresholds();
-  await loadNsfwModel();
+  // NSFW model is optional RAM-wise. On a memory-tight host that OOMs even with
+  // CLIP off, DISABLE_NSFW=true drops nsfwjs (~saves headroom); adult-content
+  // pre-screen is then skipped (civic classifier stays active).
+  if (process.env.DISABLE_NSFW === 'true') {
+    console.warn('[nsfw] DISABLE_NSFW=true — content moderation OFF (memory-saving).');
+  } else {
+    await loadNsfwModel();
+  }
   await loadCivicModel();
   // CLIP (open-set "Others") is the heaviest component (~150MB). On memory-tight
   // hosts (e.g. Render free 512MB) set DISABLE_CLIP=true to skip it — "Others"
