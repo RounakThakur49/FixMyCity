@@ -68,7 +68,11 @@ app.use((err, req, res, next) => {
 // =============================================================================
 // START SERVER
 // =============================================================================
-connectDB().catch(err => console.error('MongoDB connection error:', err));
+// Kick off the DB connect FIRST and hold the promise. Do NOT warm the in-process
+// ML models until this settles — see the ordering note in the listen callback.
+const dbReady = connectDB().catch(err => {
+  console.error('MongoDB connection error:', err);
+});
 
 const server = app.listen(PORT, () => {
   console.log(`Express server running on port ${PORT}`);
@@ -79,8 +83,19 @@ const server = app.listen(PORT, () => {
   // Either way missing/unreachable ML → complaints still save (fail-open).
   const { ML_INLINE, initInline } = require('./mlInline');
   if (ML_INLINE) {
-    console.log('[ml] ML_INLINE=true — loading pipeline in-process...');
-    initInline()
+    // ORDERING IS LOAD-BEARING on a single shared-CPU box. Loading the pure-JS
+    // tfjs civic model decodes ~41MB of weights + warms up, blocking the event
+    // loop for ~90s. The MongoDB Atlas TLS handshake (secureConnect) needs
+    // event-loop turns to finish; if the model load hogs the loop first, the
+    // handshake starves past its timeout and the INITIAL mongoose connect fails
+    // — and mongoose never retries an initial connect, so every read then
+    // buffer-times-out until a restart. Await the DB connect settling BEFORE
+    // warming ML so the handshake gets its window. (initInline stays fail-open,
+    // so complaints still save even if the model load errors after this.)
+    dbReady.then(() => {
+      console.log('[ml] ML_INLINE=true — loading pipeline in-process...');
+      return initInline();
+    })
       .then(() => console.log('[ml] In-process pipeline ready.'))
       .catch(e => console.error('[ml] In-process load error (continuing, fail-open):', e.message));
   } else if (ML_SERVICE_URL) {
