@@ -31,6 +31,10 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "20"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=460"   # raise V8 heap ceiling; Render's
+        # low default aborts (exit 134) during tfjs model load even though real
+        # RSS peaks ~280MB. 460 leaves headroom under the 512MB container cap.
       - key: ML_INLINE
         value: "true"          # run ML in-process (single free service)
       - key: DISABLE_CLIP
