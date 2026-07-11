@@ -67,13 +67,21 @@ connectDB().catch(err => console.error('MongoDB connection error:', err));
 
 const server = app.listen(PORT, () => {
   console.log(`Express server running on port ${PORT}`);
-  // Image validation runs in a separate ML service (POST ${ML_SERVICE_URL}/api/infer),
-  // called from routes/complaints.js. Backend loads NO ML models. Missing/unreachable
-  // ML service → complaints still save (fail-open).
-  if (ML_SERVICE_URL) {
+  // ML image validation. Two modes (see routes/complaints.js):
+  //   ML_INLINE=true → pipeline co-runs in THIS process (single-service deploy).
+  //     Warm the models at boot so the first complaint isn't slow.
+  //   else → delegated to a separate ML service at ML_SERVICE_URL over HTTP.
+  // Either way missing/unreachable ML → complaints still save (fail-open).
+  const { ML_INLINE, initInline } = require('./mlInline');
+  if (ML_INLINE) {
+    console.log('[ml] ML_INLINE=true — loading pipeline in-process...');
+    initInline()
+      .then(() => console.log('[ml] In-process pipeline ready.'))
+      .catch(e => console.error('[ml] In-process load error (continuing, fail-open):', e.message));
+  } else if (ML_SERVICE_URL) {
     console.log(`[ml] Image validation delegated to ML service: ${ML_SERVICE_URL}`);
   } else {
-    console.warn('[ml] ⚠️  ML_SERVICE_URL not set — image validation DISABLED (complaints save unchecked, fail-open). Set ML_SERVICE_URL to enable.');
+    console.warn('[ml] ⚠️  No ML configured (ML_INLINE unset, ML_SERVICE_URL unset) — image validation DISABLED (complaints save unchecked, fail-open).');
   }
 });
 

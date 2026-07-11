@@ -4,25 +4,43 @@ const Complaint = require('../models/Complaint');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { complaintLimiter } = require('../middleware/security');
 const { getFormattedDate } = require('../utils/datetime');
+const { ML_INLINE, inlineInfer } = require('../mlInline');
 
-// Image validation lives in a separate ML microservice (../ml-service). We call
-// it over HTTP per uploaded photo instead of importing any ML code. Config:
-//   ML_SERVICE_URL — base URL of the ML service (e.g. https://x.hf.space). Unset → skip.
-//   ML_KEY         — shared secret sent as X-ML-KEY (must match the ML service).
-//   ML_TIMEOUT_MS  — abort the call after this many ms (default 60000).
+// Image validation runs in the ML pipeline. TWO modes:
 //
-// NOTE the generous default: pure-JS @tensorflow/tfjs inference for the
-// EfficientNetV2S model runs ~15-20s/image on CPU (no native bindings). The
-// timeout only guards against a genuinely dead/hung service — it must sit WELL
-// above real inference latency, or slow-but-working inferences fail open. A host
-// with tfjs-node (native) is ~10x faster and can lower this.
+//  1. HTTP (default) — ml-service runs as a SEPARATE process/host. We POST each
+//     photo to ${ML_SERVICE_URL}/api/infer. Config:
+//       ML_SERVICE_URL — base URL (e.g. https://x.onrender.com). Unset → skip.
+//       ML_KEY         — shared secret sent as X-ML-KEY (must match the service).
+//       ML_TIMEOUT_MS  — abort after this many ms (default 60000).
+//
+//  2. IN-PROCESS (ML_INLINE=true) — backend and ML co-run in ONE process (e.g. a
+//     single Render free service, to fit the 750hr/month + 512MB limits). infer()
+//     is called directly via ../mlInline — no network hop, no ML_KEY needed. Set
+//     DISABLE_CLIP=true too to keep RAM under 512MB.
+//
+// NOTE the generous HTTP timeout default: pure-JS @tensorflow/tfjs inference runs
+// ~15-60s/image on shared CPU. The timeout only guards a genuinely dead service;
+// it must sit WELL above real latency or slow-but-working inferences fail open.
+//
+// Either way this FAILS OPEN: any error → null verdict → complaint saved unchecked.
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
 const ML_KEY = process.env.ML_KEY || '';
 const ML_TIMEOUT_MS = parseInt(process.env.ML_TIMEOUT_MS, 10) || 60000;
 
-// Call the ML service's /api/infer. Returns the verdict object, or null on any
-// failure (unset URL, network error, timeout, non-2xx) so the caller fails open.
+// Run inference. Returns the verdict object, or null on any failure so the caller
+// fails open (complaint saved unchecked).
 async function callMlInfer({ imageBase64, type, title }) {
+  // In-process path.
+  if (ML_INLINE) {
+    try {
+      return await inlineInfer({ imageBase64, type, title });
+    } catch (e) {
+      console.error('[ml] in-process infer failed — failing open:', e.message);
+      return null;
+    }
+  }
+  // HTTP path.
   if (!ML_SERVICE_URL) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ML_TIMEOUT_MS);

@@ -740,6 +740,14 @@ async function loadAll() {
   loadThresholds();
   await loadNsfwModel();
   await loadCivicModel();
+  // CLIP (open-set "Others") is the heaviest component (~150MB). On memory-tight
+  // hosts (e.g. Render free 512MB) set DISABLE_CLIP=true to skip it — "Others"
+  // then falls back to keyword TITLE_ROUTES routing (see infer.js). Civic 4-class
+  // + NSFW moderation stay fully active either way.
+  if (process.env.DISABLE_CLIP === 'true') {
+    console.log('[clip] DISABLE_CLIP=true — CLIP not loaded; "Others" uses keyword fallback.');
+    return { clipReady: false };
+  }
   const clipReady = await othersClip.load();
   return { clipReady };
 }

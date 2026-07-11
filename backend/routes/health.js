@@ -1,14 +1,33 @@
 const express = require('express');
 const router = express.Router();
+const { ML_INLINE, inlineMeta } = require('../mlInline');
 
-// Health. The ML pipeline now lives in a separate service, so model status is
-// fetched best-effort over HTTP from ${ML_SERVICE_URL}/health. The backend's own
-// liveness never depends on the ML service being reachable.
+// Health. ML status source depends on mode:
+//  - ML_INLINE=true → the pipeline runs in THIS process; read inlineMeta() directly.
+//  - else → fetch best-effort from ${ML_SERVICE_URL}/health (separate service).
+// The backend's own liveness never depends on ML being ready.
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
 const ML_HEALTH_TIMEOUT_MS = parseInt(process.env.ML_HEALTH_TIMEOUT_MS, 10) || 4000;
 
 router.get('/api/health', async (req, res) => {
   const base = { ok: true, service: 'backend' };
+
+  // In-process mode — read the co-located pipeline snapshot.
+  if (ML_INLINE) {
+    const m = inlineMeta();
+    if (!m) return res.json({ ...base, ml_service: 'in_process', ml_status: 'loading' });
+    return res.json({
+      ...base,
+      ml_service: 'in_process',
+      model_loaded: !!m.civicModel,
+      nsfw_loaded: !!m.nsfwModel,
+      clip_ready: !!m.clipReady,
+      enforce_mode: !m.ADVISORY_MODE,
+      classes: m.CIVIC_CLASSES,
+      classifier: m.civicModel ? 'custom-civic-4class-tfjs' : 'no model loaded',
+      content_moderation: m.nsfwModel ? 'active' : 'disabled',
+    });
+  }
 
   if (!ML_SERVICE_URL) {
     return res.json({ ...base, ml_service: 'not_configured' });
@@ -40,3 +59,4 @@ router.get('/api/health', async (req, res) => {
 });
 
 module.exports = router;
+
