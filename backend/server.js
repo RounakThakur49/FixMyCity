@@ -26,6 +26,11 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
 
+// Behind a reverse proxy (Render/Vercel/most PaaS) the client IP arrives in the
+// X-Forwarded-For header. Trust the first proxy hop so express-rate-limit reads
+// the real client IP instead of throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 // ---- Global middleware (order matters: security → limiter → body parsers) ----
 app.use(helmetMiddleware);
 app.use(corsMiddleware);
