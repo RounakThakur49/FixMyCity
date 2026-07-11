@@ -4,10 +4,50 @@ const Complaint = require('../models/Complaint');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { complaintLimiter } = require('../middleware/security');
 const { getFormattedDate } = require('../utils/datetime');
-const {
-  checkNSFW, classifyCivicImage, decideBlock,
-  CATEGORY_TO_CLASS, othersClip, getCivicModel,
-} = require('../ml/pipeline');
+
+// Image validation lives in a separate ML microservice (../ml-service). We call
+// it over HTTP per uploaded photo instead of importing any ML code. Config:
+//   ML_SERVICE_URL — base URL of the ML service (e.g. https://x.hf.space). Unset → skip.
+//   ML_KEY         — shared secret sent as X-ML-KEY (must match the ML service).
+//   ML_TIMEOUT_MS  — abort the call after this many ms (default 60000).
+//
+// NOTE the generous default: pure-JS @tensorflow/tfjs inference for the
+// EfficientNetV2S model runs ~15-20s/image on CPU (no native bindings). The
+// timeout only guards against a genuinely dead/hung service — it must sit WELL
+// above real inference latency, or slow-but-working inferences fail open. A host
+// with tfjs-node (native) is ~10x faster and can lower this.
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
+const ML_KEY = process.env.ML_KEY || '';
+const ML_TIMEOUT_MS = parseInt(process.env.ML_TIMEOUT_MS, 10) || 60000;
+
+// Call the ML service's /api/infer. Returns the verdict object, or null on any
+// failure (unset URL, network error, timeout, non-2xx) so the caller fails open.
+async function callMlInfer({ imageBase64, type, title }) {
+  if (!ML_SERVICE_URL) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ML_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${ML_SERVICE_URL}/api/infer`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(ML_KEY ? { 'X-ML-KEY': ML_KEY } : {}),
+      },
+      body: JSON.stringify({ imageBase64, type, title }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.error(`[ml] infer returned HTTP ${res.status} — failing open.`);
+      return null;
+    }
+    return await res.json();
+  } catch (e) {
+    console.error('[ml] infer call failed — failing open:', e.name === 'AbortError' ? 'timeout' : e.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // GET /api/complaints
 // -----------------------------------------------------------------------------
@@ -65,6 +105,9 @@ router.post('/api/complaints', requireAuth, complaintLimiter, async (req, res) =
     const activeImage = image || (images && images[0]);
     const isBase64 = activeImage && activeImage.startsWith('data:image/');
 
+    // Default advisory subdoc. The `at` timestamp is stamped here (backend owns
+    // time authority + the Asia/Kolkata string format); the ML service returns
+    // imageCheck without `at`.
     let imageCheck = {
       model: 'none',
       matched: null,
@@ -76,195 +119,30 @@ router.post('/api/complaints', requireAuth, complaintLimiter, async (req, res) =
     };
 
     // -------------------------------------------------------------------------
-    // STEP 1 — Content moderation: block adult/explicit/inappropriate images
+    // Image validation — delegated to the ML microservice (NSFW + civic + CLIP).
+    // The service returns a verdict we apply verbatim:
+    //   action:'block' → return its httpStatus (422) + blockPayload to the client
+    //   action:'accept' → store its imageCheck on the complaint (we re-stamp `at`)
+    // FAIL-OPEN: if the service is unset/unreachable/times-out, callMlInfer()
+    // returns null and the complaint is saved unchecked (same guarantee the old
+    // in-process pipeline gave when a model failed to load).
     // -------------------------------------------------------------------------
     if (isBase64) {
-      try {
-        const nsfwResult = await checkNSFW(activeImage);
-        if (nsfwResult && nsfwResult.blocked) {
-          console.warn(`[nsfw] BLOCKED upload: ${nsfwResult.category} (${(nsfwResult.score * 100).toFixed(0)}%)`);
-          return res.status(422).json({
-            blocked: true,
-            reason: 'inappropriate_content',
-            message: nsfwResult.message,
-            suggestion: 'Please upload a clear photo of the civic issue you are reporting.',
-            nsfwDetails: {
-              flaggedCategory: nsfwResult.category,
-              confidence: parseFloat((nsfwResult.score * 100).toFixed(1)),
-              allScores: nsfwResult.allScores,
-            },
+      const verdict = await callMlInfer({ imageBase64: activeImage, type, title });
+      if (verdict) {
+        if (verdict.action === 'block') {
+          return res.status(verdict.httpStatus || 422).json(verdict.blockPayload || {
+            blocked: true, message: 'Image rejected by validation.',
           });
         }
-      } catch (e) {
-        console.error('[nsfw] Pre-screen error — continuing:', e.message);
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // STEP 2 — Image validation — only for base64 uploads from citizens
-    // -------------------------------------------------------------------------
-    if (isBase64 && CATEGORY_TO_CLASS[type]) {
-      if (!getCivicModel()) {
-        // Model not loaded — log and allow (never block citizens due to ML failure)
-        imageCheck.note = 'AI validation unavailable — model not loaded. Submission accepted.';
-        console.warn('[civic] Model not loaded — skipping image validation for', type);
+        // action === 'accept' — adopt the service's imageCheck, stamp our time.
+        imageCheck = { ...(verdict.imageCheck || {}), at: getFormattedDate() };
       } else {
-        try {
-          const classProbs = await classifyCivicImage(activeImage);
-
-          if (!classProbs) {
-            imageCheck.note = 'AI validation returned no result — submission accepted.';
-          } else {
-            const actualProbs = classProbs.classProbs || classProbs;
-            const logits = classProbs.logits || null;
-
-            const probsStr = Object.entries(actualProbs)
-              .sort(([, a], [, b]) => b - a)
-              .map(([cls, p]) => `${cls}:${(p * 100).toFixed(0)}%`)
-              .join(', ');
-
-            if (type === 'Others') {
-              // ---------------------------------------------------------------
-              // OPEN-SET "Others": NEVER hard-blocked. CLIP (text+image
-              // embedding similarity, others_clip.js) is authoritative for the
-              // advisory suggestion. Keyword TITLE_ROUTES is only a fallback
-              // when CLIP is unavailable. The civic model still ran above for
-              // advisory classProbs, but its decision is ignored for blocking.
-              // decideBlock is invoked with openSet:true so it can only emit
-              // advisory metadata (no 422 path for Others).
-              // ---------------------------------------------------------------
-              const decision = decideBlock(actualProbs, 'Others', { logits, openSet: true });
-
-              let advisoryNote = '';
-              let clipScores = null;
-              let clipSuggestion = null;
-              let clipOodScore = null;
-
-              let clip = null;
-              if (othersClip.isReady()) {
-                try {
-                  clip = await othersClip.classifyOthers({ imageBase64: activeImage, title });
-                } catch (clipErr) {
-                  console.error('[clip] classifyOthers error — falling back to advisory:', clipErr.message);
-                  clip = null;
-                }
-              }
-
-              if (clip) {
-                // CLIP authoritative advisory.
-                clipScores = clip.scores || null;
-                clipSuggestion = clip.suggestedClass || null;
-                clipOodScore = typeof clip.oodScore === 'number'
-                  ? parseFloat(clip.oodScore.toFixed(4)) : null;
-                const simStr = typeof clip.oodScore === 'number' ? clip.oodScore.toFixed(2) : '?';
-
-                if (clip.isCivic && clip.suggestedClass && clip.suggestedClass !== 'Others') {
-                  advisoryNote = `Looks closest to "${clip.suggestedClass}" (sim ${simStr}) — you may want to re-categorize.`;
-                } else if (clip.isCivic && clip.suggestedClass === 'Others') {
-                  advisoryNote = `Recognized as a "${clip.suggestedSubtype || 'general'}" issue.`;
-                } else {
-                  advisoryNote = 'Accepted as a novel/open-set civic issue.';
-                }
-                console.log(
-                  `[clip] Others "${title}" → suggested="${clip.suggestedClass}" ` +
-                  `subtype="${clip.suggestedSubtype}" sim=${simStr} isCivic=${clip.isCivic}`
-                );
-              } else {
-                // Fallback advisory: cheap keyword routing only. Never blocks.
-                const t = (title || '').toLowerCase();
-                let routedType = null;
-                for (const route of TITLE_ROUTES) {
-                  if (route.keywords.some(kw => t.includes(kw))) {
-                    routedType = route.targetType;
-                    break;
-                  }
-                }
-                if (routedType) {
-                  advisoryNote = `Based on the title, this may be a "${routedType}" issue — you may want to re-categorize.`;
-                  console.log(`[civic] Others title "${title}" → keyword advisory "${routedType}" (CLIP unavailable)`);
-                } else if (decision.suggestion) {
-                  advisoryNote = decision.suggestion;
-                } else {
-                  advisoryNote = 'Accepted as an open-set civic issue.';
-                }
-              }
-
-              console.log(
-                `[civic] declared="Others" (open-set) probs=[${probsStr}] ` +
-                `→ ✅ ACCEPT (${clip ? 'clip' : 'keyword/advisory'})`
-              );
-
-              imageCheck = {
-                model: 'custom-civic-4class-tfjs',
-                matched: true,
-                blocked: false,
-                score: decision.declaredProb,
-                classProbs: actualProbs,
-                note: advisoryNote,
-                clipScores,
-                clipSuggestion,
-                clipOodScore,
-                at: getFormattedDate(),
-              };
-              // Others is open-set: no hard-block / no 422 path.
-            } else {
-              // -------------------------------------------------------------
-              // Specific declared category: the civic model decides on the
-              // calibrated probabilities. decideBlock self-suppresses blocking
-              // in ADVISORY_MODE or when the class is flagged unreliable.
-              // -------------------------------------------------------------
-              const decision = decideBlock(actualProbs, type, { logits });
-
-              console.log(
-                `[civic] declared="${type}" class="${decision.declaredClass}" ` +
-                `declared_prob=${(decision.declaredProb * 100).toFixed(0)}% ` +
-                `threshold=${(decision.threshold || 0) * 100 || '?'}% ` +
-                `top="${decision.topClass}" top_prob=${(decision.topProb * 100).toFixed(0)}% ` +
-                `→ ${decision.block ? '❌ BLOCK' : '✅ ACCEPT'} (${decision.reason})`
-              );
-
-              imageCheck = {
-                model: 'custom-civic-4class-tfjs',
-                matched: !decision.block,
-                blocked: decision.block,
-                score: decision.declaredProb,
-                classProbs: actualProbs,
-                note: decision.block ? decision.message : `✅ Image matches "${type}" (${(decision.declaredProb * 100).toFixed(0)}% confidence).`,
-                at: getFormattedDate(),
-              };
-
-              // Block the submission — return 422 with user-friendly message
-              if (decision.block) {
-                return res.status(422).json({
-                  blocked: true,
-                  message: decision.message,
-                  suggestion: decision.suggestion || '',
-                  aiDetails: {
-                    declaredCategory: type,
-                    declaredClass: decision.declaredClass,
-                    declaredConfidence: parseFloat((decision.declaredProb * 100).toFixed(1)),
-                    topClass: decision.topClass,
-                    topConfidence: parseFloat((decision.topProb * 100).toFixed(1)),
-                    reason: decision.reason,
-                  },
-                });
-              }
-            }
-          }
-        } catch (inferenceErr) {
-          // Inference error — log but NEVER block the citizen
-          console.error('[civic] Inference error — allowing submission:', inferenceErr.message);
-          const looksPng = (typeof activeImage === 'string' && /^data:image\/png/i.test(activeImage))
-            || /PNG decoding/i.test(inferenceErr.message || '');
-          imageCheck.note = looksPng
-            ? 'png_unvalidated — image not screened by classifier'
-            : 'AI validation error — submission accepted without check.';
-        }
+        // Fail-open: ML service unavailable.
+        imageCheck.note = 'AI validation unavailable — submission accepted.';
       }
-    } else if (!isBase64) {
+    } else {
       imageCheck.note = 'URL or seed image — AI validation skipped.';
-    } else if (!CATEGORY_TO_CLASS[type]) {
-      imageCheck.note = `Unknown complaint type "${type}" — AI validation skipped.`;
     }
 
     // -------------------------------------------------------------------------

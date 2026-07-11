@@ -5,8 +5,10 @@
 //   config/db.js         — Mongo connect + boot seed
 //   middleware/security.js — helmet, cors, rate limiters
 //   middleware/auth.js   — JWT issue/verify, requireAuth/requireAdmin
-//   ml/pipeline.js       — NSFW + civic classifier + OOD + CLIP (all model state)
 //   routes/*.js          — auth, complaints, stats, reviews, health
+// The ML image pipeline now lives in a SEPARATE service (../ml-service), called
+// over HTTP from routes/complaints.js. The backend holds NO ML deps or models;
+// it fails open (saves the complaint) if the ML service is unset/unreachable.
 //   utils/               — datetime, aadhaar mask
 // Route paths are unchanged (full /api/... paths, mounted at '/') so the API
 // contract and the live frontend/Vercel deploy are byte-for-byte compatible.
@@ -19,10 +21,10 @@ const { connectDB } = require('./config/db');
 const {
   helmetMiddleware, corsMiddleware, globalLimiter,
 } = require('./middleware/security');
-const ml = require('./ml/pipeline');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
 
 // ---- Global middleware (order matters: security → limiter → body parsers) ----
 app.use(helmetMiddleware);
@@ -65,13 +67,14 @@ connectDB().catch(err => console.error('MongoDB connection error:', err));
 
 const server = app.listen(PORT, () => {
   console.log(`Express server running on port ${PORT}`);
-  // Load all ML models (thresholds → nsfw → civic → CLIP). Non-blocking and
-  // fail-open — boot never crashes if any model is unavailable.
-  ml.loadAll()
-    .then(({ clipReady }) => {
-      console.log(`[clip] Others open-set classifier ${clipReady ? 'ready.' : 'DISABLED (keyword fallback only).'}`);
-    })
-    .catch(e => console.error('[ml] Model load error (continuing, fail-open):', e.message));
+  // Image validation runs in a separate ML service (POST ${ML_SERVICE_URL}/api/infer),
+  // called from routes/complaints.js. Backend loads NO ML models. Missing/unreachable
+  // ML service → complaints still save (fail-open).
+  if (ML_SERVICE_URL) {
+    console.log(`[ml] Image validation delegated to ML service: ${ML_SERVICE_URL}`);
+  } else {
+    console.warn('[ml] ⚠️  ML_SERVICE_URL not set — image validation DISABLED (complaints save unchecked, fail-open). Set ML_SERVICE_URL to enable.');
+  }
 });
 
 // =============================================================================

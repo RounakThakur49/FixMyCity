@@ -19,6 +19,7 @@ build/
 .env.production.local
 backend/.env
 frontend/.env
+ml-service/.env
 
 # Python venv / cache
 backend/.venv/
@@ -28,6 +29,7 @@ backend/__pycache__/
 
 # CLIP model download cache (@xenova/transformers + build_others_exemplars.py)
 backend/.cache/
+ml-service/.cache/
 
 # Training dataset (large; bring your own per README)
 backend/my_dataset/

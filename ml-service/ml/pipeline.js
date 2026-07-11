@@ -771,4 +771,5 @@ module.exports = {
   othersClip,
   CIVIC_CLASSES,
   CATEGORY_TO_CLASS,
+  TITLE_ROUTES,
 };
