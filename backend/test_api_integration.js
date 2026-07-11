@@ -80,18 +80,33 @@ function getRandomImage(category) {
   return path.join(dir, random);
 }
 
+// Module-level JWT — populated by login() before the write tests. Writes
+// (POST /api/complaints) require auth since the July 2026 JWT hardening.
+let AUTH_TOKEN = '';
+
+async function login(identifier, password) {
+  const { status, body } = await apiPost('/api/auth/login', { identifier, phone: identifier, password });
+  if ((status === 200) && body.token) {
+    AUTH_TOKEN = body.token;
+    return true;
+  }
+  return false;
+}
+
 async function apiPost(endpoint, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(data),
+    };
+    if (AUTH_TOKEN) headers.Authorization = `Bearer ${AUTH_TOKEN}`;
     const options = {
       hostname: 'localhost',
       port: 5000,
       path: endpoint,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-      },
+      headers,
     };
     const req = http.request(options, res => {
       let raw = '';
@@ -133,15 +148,15 @@ async function runTests() {
     const { status, body } = await apiGet('/api/health');
     if (status === 200 && body.ok) {
       log('PASS', `Server running (HTTP ${status})`);
+      if (body.ml_service) console.log(`    ML service: ${body.ml_service}`);
       body.model_loaded
-        ? log('PASS', 'Civic model loaded (enforce mode)')
+        ? log('PASS', 'Civic model loaded (via ML service)')
         : log('WARN', 'Civic model NOT loaded — image validation disabled');
       body.nsfw_loaded
         ? log('PASS', 'NSFW model loaded (content moderation active)')
         : log('WARN', 'NSFW model NOT loaded — adult content filtering disabled');
       console.log(`\n    Classifier: ${body.classifier}`);
       console.log(`    Content moderation: ${body.content_moderation}`);
-      console.log(`    Thresholds: ${JSON.stringify(body.thresholds)}`);
     } else {
       log('FAIL', `Unexpected response: HTTP ${status}`);
     }
@@ -150,6 +165,13 @@ async function runTests() {
     console.log('\n  Cannot continue tests — start server with: npm run dev');
     process.exit(1);
   }
+
+  // ---- Test 1b: Auth (login as seeded citizen; writes need a JWT) ----
+  section('TEST 1b: Auth — login seeded citizen for write tests');
+  const loggedIn = await login('9876543210', 'citizen123');
+  loggedIn
+    ? log('PASS', 'Logged in — JWT acquired for POST /api/complaints')
+    : log('FAIL', 'Login failed — complaint POSTs will 401 (check seeded citizen 9876543210/citizen123)');
 
   // ---- Test 2: Correct category submissions ----
   section('TEST 2: Correct-Category Submissions (should be ACCEPTED)');

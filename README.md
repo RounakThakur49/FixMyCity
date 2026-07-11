@@ -4,6 +4,12 @@ Citizen-powered civic complaint platform. Residents report road / pothole / drai
 
 Built for **SIH PS 25031** (Smart India Hackathon — Civic Issue Reporting).
 
+FixMyCity is a **3-tier application**:
+
+- **Frontend** (`frontend/`) — React 19 (CRA) SPA, deployed to Vercel. Talks only to the backend.
+- **Backend** (`backend/`) — Express + MongoDB + JWT API. Lightweight (no ML deps); handles auth, CRUD, and proxies image validation to the ML service.
+- **ML service** (`ml-service/`) — standalone Express inference service (EfficientNetV2S civic classifier + NSFW moderation + CLIP), deployed to Hugging Face Spaces. Called server-to-server by the backend.
+
 ---
 
 ## Stack
@@ -11,12 +17,38 @@ Built for **SIH PS 25031** (Smart India Hackathon — Civic Issue Reporting).
 | Layer | Tech |
 |-------|------|
 | Frontend | React 19 (Create React App), framer-motion, lucide-react, Google Maps |
-| Backend | Node.js 20 LTS, Express 4, Mongoose, bcryptjs, helmet, express-rate-limit |
+| Backend | Node.js 20 LTS, Express 4, Mongoose, bcryptjs, jsonwebtoken, helmet, express-rate-limit — **no ML deps** |
 | Database | MongoDB (Atlas cluster or local) |
-| ML (runtime) | `@tensorflow/tfjs` (pure-JS), `nsfwjs`, `@xenova/transformers` (CLIP) |
+| ML service | Node.js 20 LTS, Express 4 + `@tensorflow/tfjs` (pure-JS), `nsfwjs`, `@xenova/transformers` (CLIP) |
 | ML (training) | Python 3.11, TensorFlow/Keras, EfficientNetV2S backbone, scikit-learn |
 
-The image validation pipeline runs a **custom 4-class civic model** (EfficientNetV2S, trained on ~5,500 images) that can block submissions when the photo doesn't match the declared category. NSFW content moderation blocks inappropriate uploads. An advisory mode degrades gracefully when model confidence is low.
+The image validation pipeline runs a **custom 4-class civic model** (EfficientNetV2S, trained on ~5,500 images) that can block submissions when the photo doesn't match the declared category. NSFW content moderation blocks inappropriate uploads. An advisory mode degrades gracefully when model confidence is low. **These models now run in the separate `ml-service/` tier** — the backend calls it over HTTP and **fails open** (saves the complaint unchecked) if the service is unreachable.
+
+---
+
+## Architecture
+
+```
+   Browser
+      │  (HTTPS, JWT Bearer on writes; reads public)
+      ▼
+┌─────────────┐        ┌──────────────────────┐        ┌───────────────────────┐
+│  Frontend   │───────▶│      Backend         │───────▶│      ML service       │
+│  React 19   │  REST  │  Express + JWT + CRUD │  HTTP  │  EfficientNetV2S +    │
+│  (Vercel)   │◀───────│      (Render/HF)      │◀───────│  nsfwjs + CLIP        │
+└─────────────┘        └──────────┬───────────┘ X-ML-KEY│  (HF Spaces, :7860)   │
+                                  │                      └───────────────────────┘
+                                  ▼
+                         ┌────────────────┐
+                         │  MongoDB Atlas │
+                         └────────────────┘
+```
+
+- **Frontend → Backend** — all data + JWT auth. Base URL from `REACT_APP_API_URL` (baked at build time).
+- **Backend → ML service** — server-to-server (no CORS), guarded by a shared `X-ML-KEY` secret. **Fails open**: if the ML service is down/unreachable, the complaint still saves without image validation.
+- **Backend → MongoDB Atlas** — users, complaints, reviews.
+
+Each tier runs and deploys independently. See [`DEPLOY.md`](./DEPLOY.md) for the full runbook.
 
 ---
 
@@ -53,22 +85,46 @@ cd FixMyCity
 
 Install MongoDB Community Server and run it. Default URI: `mongodb://127.0.0.1:27017/FixMyCity`.
 
-### 3. Backend
+### 3. ML service
+
+Start the inference tier **first** — the backend calls it during complaint uploads (and fails open if it's down). In its own terminal:
+
+```bash
+cd ml-service
+npm install
+node server.js
+```
+
+Listens on **`http://localhost:7860`**. Optionally create `ml-service/.env` (see `ml-service/.env.example`):
+
+```env
+PORT=7860
+ML_KEY=           # leave blank for local dev; set the same value on the backend to lock down /api/infer
+```
+
+First boot loads the tfjs + nsfwjs + CLIP models (several seconds). Endpoints: `POST /api/infer` (guarded by `X-ML-KEY` when `ML_KEY` is set) and `GET /health`.
+
+### 4. Backend
 
 ```bash
 cd backend
 npm install
 ```
 
-Create `backend/.env`:
+Create `backend/.env` (see `backend/.env.example` for all options):
 
 ```env
 MONGO_URI=mongodb+srv://your_user:your_pass@cluster.xxxxx.mongodb.net/FixMyCity?retryWrites=true&w=majority
 PORT=5000
 JWT_SECRET=change-me-to-a-long-random-string
+CORS_ORIGIN=http://localhost:3000
+ML_SERVICE_URL=http://localhost:7860
+ML_KEY=           # must MATCH the ml-service ML_KEY (blank both for local dev)
 ```
 
-> **`JWT_SECRET` is required for real auth.** If unset, the server falls back to an insecure dev value and warns at boot — fine for local dev, never for a deployed/Vercel build. Generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`.
+> **`JWT_SECRET` is required for real auth.** If unset, the server falls back to an insecure dev value and warns at boot — fine for local dev, never for a deployed build. Generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`.
+>
+> **`ML_SERVICE_URL`** points at the ML service (step 3). If unset or unreachable, image validation is skipped and complaints save unchecked (**fail-open**).
 
 Start backend:
 
@@ -81,13 +137,10 @@ Expected boot output:
 ```
 Express server running on port 5000
 Connected to MongoDB.
-[nsfw] Content moderation model ready.
-[civic] Civic graph model loaded. Classes: [ 'drainage', 'others', 'potholes', 'streetlight' ]
-[civic] Logits head present: true
-[clip] Others open-set classifier ready.
+[ml] Image validation delegated to ML service: http://localhost:7860
 ```
 
-### 4. Frontend
+### 5. Frontend
 
 In a **new terminal**:
 
@@ -97,17 +150,20 @@ npm install
 npm start
 ```
 
-App opens at `http://localhost:3000`.
+App opens at `http://localhost:3000`. The frontend reads the backend URL from `REACT_APP_API_URL` (see `frontend/.env.example`; defaults to `http://localhost:5000`).
 
-### 5. Log in
+### 6. Log in
+
+Default users are seeded on first connect (only if the DB is empty), defined in
+`backend/db/seed.js`. The seeded **citizen** demo login is:
 
 | Role | Username | Password |
 |------|----------|----------|
-| Admin | `admin@fixmycity` | `rounak123` |
 | Citizen | `9876543210` | `citizen123` |
-| Citizen | `9123456780` | `citizen123` |
 
-These are seeded automatically on first connect (only if the DB is empty).
+The admin account is also seeded there. **Change the seeded admin credentials in
+`backend/db/seed.js` before any public deployment** — do not ship the demo admin
+password. Passwords are bcrypt-hashed; each user needs a distinct Aadhaar.
 
 > **Auth (July 2026):** login/register return a signed **JWT**. The frontend stores it in the `session` object and sends `Authorization: Bearer <token>` on all writes. Reads (`GET`) stay public. Server-side middleware enforces roles — a citizen token cannot hit admin routes (status/delete). A 401 on any write forces a clean re-login.
 
@@ -116,8 +172,54 @@ These are seeded automatically on first connect (only if the DB is empty).
 ## Health check
 
 ```bash
-curl http://localhost:5000/api/health
+curl http://localhost:5000/api/health   # backend (proxies ML service /health)
+curl http://localhost:7860/health        # ML service directly
 ```
+
+---
+
+## Environment variables
+
+Each tier has its own `.env.example` — copy it to `.env` for local dev, or set the values in your host's dashboard for deployment.
+
+**Frontend** (`frontend/.env.example`):
+
+| Var | Purpose |
+|-----|---------|
+| `REACT_APP_API_URL` | Base URL of the backend API. **Baked at build time** — redeploy after changing. Defaults to `http://localhost:5000`. |
+| `REACT_APP_GOOGLE_MAPS_API_KEY` | (Optional) Google Maps key; without it the map falls back to geolocation-only. |
+
+**Backend** (`backend/.env.example`):
+
+| Var | Purpose |
+|-----|---------|
+| `MONGO_URI` | MongoDB connection string (Atlas or local). Falls back to local `mongod`. |
+| `JWT_SECRET` | JWT signing secret. **Set a strong random value in production** (unset → insecure dev fallback + boot warning). |
+| `CORS_ORIGIN` | Comma-separated allowed browser origins. Defaults to `http://localhost:3000`. |
+| `ML_SERVICE_URL` | Base URL of the ML service. Unset/unreachable → image validation skipped (fail-open). |
+| `ML_KEY` | Shared secret sent as `X-ML-KEY` to the ML service. Must **match** the ML service's `ML_KEY`. |
+| `PORT` | Backend listen port (default 5000). |
+
+**ML service** (`ml-service/.env.example`):
+
+| Var | Purpose |
+|-----|---------|
+| `PORT` | Listen port. **Hugging Face Spaces requires 7860.** |
+| `ML_KEY` | Shared secret. When set, `POST /api/infer` requires header `X-ML-KEY: <ML_KEY>`. Blank → endpoint open (local dev only). |
+
+---
+
+## Deployment
+
+Deploy each tier independently:
+
+- **ML service** → Hugging Face Spaces (Docker, port 7860, 16GB free tier)
+- **Backend** → Render (or HF) — `backend/render.yaml` is provided
+- **Frontend** → Vercel
+
+See **[`DEPLOY.md`](./DEPLOY.md)** for the full step-by-step runbook (order, secrets, CORS wiring, verification).
+
+> **Gotcha:** CRA bakes `REACT_APP_*` into the JS bundle at **build time**. After changing `REACT_APP_API_URL` on Vercel you must trigger a **redeploy** — a plain env edit does nothing until the next build.
 
 ---
 
@@ -126,10 +228,11 @@ curl http://localhost:5000/api/health
 Playwright suite in `tests/e2e/complaints.spec.js` (UI structure, health/model, ML accept/block, input validation, **JWT auth/authorization, Aadhaar Verhoeff validation**).
 
 ```bash
-# With backend + frontend running (backend via `npm run dev`):
+# With ml-service (node server.js), backend (npm run dev), and frontend running:
 DISABLE_RATE_LIMIT=true npx playwright test
 ```
 
+- The ML accept/block assertions require the **ML service** running and `ML_SERVICE_URL` set on the backend (otherwise the backend fails open and never blocks).
 - `DISABLE_RATE_LIMIT=true` (backend env, **dev/test only**) bypasses the 5/min complaint limiter so the suite's rapid POSTs don't 429. Never set in production.
 - The suite logs in once as a seeded citizen in `beforeAll` and attaches the JWT to every `POST /api/complaints` (complaint creation now requires auth). Reads need no token.
 - The image-picking helper skips known-contaminated dataset prefixes (`scrape_`/`drain_`/`bing_`) so ACCEPT assertions run on clean images.
@@ -141,34 +244,42 @@ DISABLE_RATE_LIMIT=true npx playwright test
 
 ```
 FixMyCity/
-├── backend/                        # modular Express app (July 2026 refactor)
+├── backend/                        # LIGHT Express app — auth + CRUD, no ML deps
 │   ├── server.js                   # thin composition root (~115 lines)
 │   ├── config/db.js                # connectDB(): mongoose connect + seed
 │   ├── db/seed.js                  # default users/complaints seeding
 │   ├── middleware/
 │   │   ├── security.js             # helmet, cors, rate limiters
 │   │   └── auth.js                 # JWT issue/verify, requireAuth/requireAdmin
-│   ├── ml/pipeline.js              # ENTIRE ML pipeline (NSFW+civic+OOD+CLIP)
 │   ├── routes/                     # health, stats, auth, complaints, reviews
 │   ├── utils/                      # datetime, aadhaar mask
 │   ├── aadhaar.js                  # Verhoeff validation (shared w/ frontend)
-│   ├── others_clip.js              # CLIP open-set classifier for "Others"
 │   ├── models/                     # Mongoose schemas (User, Admin, Complaint, Review)
-│   ├── server.monolith.bak.js      # pre-refactor backup (delete once stable)
-│   ├── .env                        # MONGO_URI, JWT_SECRET (you create this)
+│   ├── .env.example                # MONGO_URI, JWT_SECRET, CORS_ORIGIN, ML_SERVICE_URL, ML_KEY
+│   ├── render.yaml                 # Render deploy config
 │   ├── train_civic_model.py        # EfficientNetV2S 3-stage training
 │   ├── temperature_scaling.py      # Post-training threshold calibration
 │   ├── audit_dataset.py            # Dataset quality audit
 │   ├── civic_model.keras           # Keras source-of-truth model
 │   ├── civic_labels.json           # Class order
-│   ├── civic_thresholds.json       # Calibrated thresholds + OOD config
-│   ├── civic_model_tfjs/           # TFJS-converted model (loaded at runtime)
 │   └── my_dataset/                 # Training images (gitignored)
 │       ├── potholes/   (~1,578)
 │       ├── streetlight/ (~1,640)
 │       ├── drainage/   (~1,101)
 │       └── others/     (~1,235)
+├── ml-service/                     # STANDALONE inference microservice (HF Spaces)
+│   ├── server.js                   # Express: POST /api/infer (X-ML-KEY), GET /health
+│   ├── infer.js                    # per-image pipeline entrypoint
+│   ├── ml/pipeline.js              # NSFW + civic classifier + OOD + CLIP
+│   ├── others_clip.js              # CLIP open-set classifier for "Others"
+│   ├── civic_model_tfjs/           # TFJS-converted model (loaded at runtime)
+│   ├── civic_thresholds.json       # Calibrated thresholds + OOD config
+│   ├── civic_exemplars.json        # CLIP exemplar embeddings for "Others"
+│   ├── Dockerfile                  # HF Spaces build (port 7860)
+│   ├── .env.example                # PORT=7860, ML_KEY
+│   └── README.md                   # ML service docs
 ├── frontend/
+│   ├── .env.example                # REACT_APP_API_URL, Google Maps key
 │   ├── src/
 │   │   ├── App.js                  # Single source of truth — all state + handlers
 │   │   ├── aadhaar.js              # Verhoeff validation (mirror of backend)
@@ -184,6 +295,7 @@ FixMyCity/
 │   │       └── Timeline.jsx
 │   └── public/
 ├── tests/e2e/                      # Playwright suite
+├── DEPLOY.md                       # Full deployment runbook (HF + Render + Vercel)
 ├── CLAUDE.md                       # AI assistant instructions + roadmap
 └── README.md                       # This file
 ```
@@ -192,7 +304,7 @@ FixMyCity/
 
 ## AI Image Validation Pipeline
 
-The backend runs a multi-stage ML pipeline on every complaint photo upload:
+The **ML service** (`ml-service/`) runs a multi-stage pipeline on every complaint photo. The backend forwards the image to `POST /api/infer` (guarded by `X-ML-KEY`) and applies the verdict; if the service is unreachable the backend **fails open** and saves the complaint unchecked.
 
 ### Stage 1: NSFW Content Moderation
 `nsfwjs` checks for adult/explicit content. Porn/Hentai >40% or Sexy >70% → **hard-block** (HTTP 422).
@@ -295,10 +407,13 @@ python audit_dataset.py
 
 Flags images whose folder label disagrees with model prediction. Review `audit_report.csv`, fix misplaced images, retrain.
 
-### Step 6 — Restart backend
+### Step 6 — Deploy the new model to the ML service
+
+Training runs in `backend/` (Python), but the runtime model lives in `ml-service/`. Copy the newly-trained TFJS model + calibration artifacts into `ml-service/` (`civic_model_tfjs/`, `civic_thresholds.json`, `civic_labels.json`), then restart the ML service:
 
 ```bash
-npm run dev
+cd ml-service
+node server.js
 ```
 
 ---
@@ -352,9 +467,11 @@ Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 | `npm install` fails on `@tensorflow/tfjs-node` | This project uses pure-JS tfjs. Run `npm uninstall @tensorflow/tfjs-node` |
 | `MongoServerError: bad auth` | Wrong MONGO_URI user/password. URL-encode special characters. |
 | `MongooseError: Could not connect` | Atlas Network Access doesn't include your IP. Add `0.0.0.0/0` for dev. |
-| Frontend shows "Could not connect to server" | Backend not running or wrong port. Check `http://localhost:5000/api/health`. |
+| Frontend shows "Could not connect to server" | Backend not running or wrong port. Check `http://localhost:5000/api/health`. Also verify `REACT_APP_API_URL`. |
 | Node 24 errors | Use Node 20 LTS. TFJS native prebuilts don't exist for NAPI v10. |
-| `[civic] civic_model_tfjs/model.json not found` | Train the model first: `python train_civic_model.py` |
+| `[civic] civic_model_tfjs/model.json not found` (ML service) | Train the model first (`python train_civic_model.py`) and copy `civic_model_tfjs/` into `ml-service/`. |
+| Complaints save but images never blocked | ML service down/unreachable, or `ML_SERVICE_URL` unset — backend fails open. Start `ml-service` and set `ML_SERVICE_URL`. |
+| ML service returns 401/403 | `ML_KEY` mismatch between backend and ml-service. Set the **same** value on both. |
 | External images fail classification | Domain gap — retrain with real-world photos. See Colab notebook section. |
 | PNG upload fails | Fixed in latest — `pngjs` handles real PNG images. Run `npm install` to get the dependency. |
 
@@ -362,11 +479,13 @@ Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 
 ## Production
 
+Build the frontend:
+
 ```bash
 cd frontend && npm run build    # output in frontend/build/
 ```
 
-Backend: use `pm2` or `systemd` to keep `npm start` alive in `backend/`.
+For a hosted deployment (Vercel + Render + Hugging Face Spaces), follow **[`DEPLOY.md`](./DEPLOY.md)**. For a self-managed setup, keep `backend` (`npm start`) and `ml-service` (`node server.js`) alive with `pm2` or `systemd`.
 
 ---
 

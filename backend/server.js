@@ -5,8 +5,10 @@
 //   config/db.js         — Mongo connect + boot seed
 //   middleware/security.js — helmet, cors, rate limiters
 //   middleware/auth.js   — JWT issue/verify, requireAuth/requireAdmin
-//   ml/pipeline.js       — NSFW + civic classifier + OOD + CLIP (all model state)
 //   routes/*.js          — auth, complaints, stats, reviews, health
+// The ML image pipeline now lives in a SEPARATE service (../ml-service), called
+// over HTTP from routes/complaints.js. The backend holds NO ML deps or models;
+// it fails open (saves the complaint) if the ML service is unset/unreachable.
 //   utils/               — datetime, aadhaar mask
 // Route paths are unchanged (full /api/... paths, mounted at '/') so the API
 // contract and the live frontend/Vercel deploy are byte-for-byte compatible.
@@ -19,10 +21,15 @@ const { connectDB } = require('./config/db');
 const {
   helmetMiddleware, corsMiddleware, globalLimiter,
 } = require('./middleware/security');
-const ml = require('./ml/pipeline');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
+
+// Behind a reverse proxy (Render/Vercel/most PaaS) the client IP arrives in the
+// X-Forwarded-For header. Trust the first proxy hop so express-rate-limit reads
+// the real client IP instead of throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
 
 // ---- Global middleware (order matters: security → limiter → body parsers) ----
 app.use(helmetMiddleware);
@@ -65,13 +72,22 @@ connectDB().catch(err => console.error('MongoDB connection error:', err));
 
 const server = app.listen(PORT, () => {
   console.log(`Express server running on port ${PORT}`);
-  // Load all ML models (thresholds → nsfw → civic → CLIP). Non-blocking and
-  // fail-open — boot never crashes if any model is unavailable.
-  ml.loadAll()
-    .then(({ clipReady }) => {
-      console.log(`[clip] Others open-set classifier ${clipReady ? 'ready.' : 'DISABLED (keyword fallback only).'}`);
-    })
-    .catch(e => console.error('[ml] Model load error (continuing, fail-open):', e.message));
+  // ML image validation. Two modes (see routes/complaints.js):
+  //   ML_INLINE=true → pipeline co-runs in THIS process (single-service deploy).
+  //     Warm the models at boot so the first complaint isn't slow.
+  //   else → delegated to a separate ML service at ML_SERVICE_URL over HTTP.
+  // Either way missing/unreachable ML → complaints still save (fail-open).
+  const { ML_INLINE, initInline } = require('./mlInline');
+  if (ML_INLINE) {
+    console.log('[ml] ML_INLINE=true — loading pipeline in-process...');
+    initInline()
+      .then(() => console.log('[ml] In-process pipeline ready.'))
+      .catch(e => console.error('[ml] In-process load error (continuing, fail-open):', e.message));
+  } else if (ML_SERVICE_URL) {
+    console.log(`[ml] Image validation delegated to ML service: ${ML_SERVICE_URL}`);
+  } else {
+    console.warn('[ml] ⚠️  No ML configured (ML_INLINE unset, ML_SERVICE_URL unset) — image validation DISABLED (complaints save unchecked, fail-open).');
+  }
 });
 
 // =============================================================================
