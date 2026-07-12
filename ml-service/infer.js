@@ -28,11 +28,34 @@ const {
   othersClip,
   getCivicModel,
   TITLE_ROUTES,
+  decodeSharedTensor,
+  disposeTensor,
 } = require('./ml/pipeline');
 
 async function infer({ imageBase64, type, title }) {
   const activeImage = imageBase64;
   const isBase64 = activeImage && activeImage.startsWith('data:image/');
+
+  // Decode the image to a tensor ONCE and share it across the NSFW pre-screen
+  // and the civic classifier — both need the same [H,W,3] pixels, so decoding
+  // twice (a full JPEG/PNG decode + per-pixel RGBA→RGB loop + large alloc) was
+  // pure waste per request. Decoding here also caps peak memory to one raw
+  // tensor. Best-effort: if the decode throws (corrupt/unsupported image) we
+  // pass null and each stage falls back to decoding itself (unchanged path).
+  let sharedTensor = null;
+  if (isBase64) {
+    try { sharedTensor = decodeSharedTensor(activeImage); }
+    catch (e) { console.error('[infer] shared decode failed — stages will decode individually:', e.message); }
+  }
+
+  try {
+    return await inferInner({ activeImage, isBase64, type, title, sharedTensor });
+  } finally {
+    disposeTensor(sharedTensor);
+  }
+}
+
+async function inferInner({ activeImage, isBase64, type, title, sharedTensor }) {
 
   // Default advisory subdoc (no `at` — backend stamps).
   let imageCheck = {
@@ -49,7 +72,7 @@ async function infer({ imageBase64, type, title }) {
   // ---------------------------------------------------------------------------
   if (isBase64) {
     try {
-      const nsfwResult = await checkNSFW(activeImage);
+      const nsfwResult = await checkNSFW(activeImage, sharedTensor);
       if (nsfwResult && nsfwResult.blocked) {
         console.warn(`[nsfw] BLOCKED upload: ${nsfwResult.category} (${(nsfwResult.score * 100).toFixed(0)}%)`);
         return {
@@ -90,7 +113,7 @@ async function infer({ imageBase64, type, title }) {
       console.warn('[civic] Model not loaded — skipping image validation for', type);
     } else {
       try {
-        const classProbs = await classifyCivicImage(activeImage);
+        const classProbs = await classifyCivicImage(activeImage, sharedTensor);
 
         if (!classProbs) {
           imageCheck.note = 'AI validation returned no result — submission accepted.';

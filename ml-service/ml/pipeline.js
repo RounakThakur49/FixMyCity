@@ -45,12 +45,20 @@ async function loadNsfwModel() {
   }
 }
 
-async function checkNSFW(base64Str) {
+// checkNSFW(base64Str, sharedTensor?)
+//   sharedTensor — an OPTIONAL pre-decoded [H,W,3] tensor (from decodeImageToTensor).
+//   When supplied, we reuse it instead of decoding the JPEG/PNG again — the civic
+//   path decodes the SAME image microseconds later, so infer() decodes once and
+//   hands the tensor to both. Ownership stays with the CALLER: we never dispose a
+//   shared tensor here (only the uint8 copy we make from it). When omitted we
+//   decode-and-dispose locally, exactly as before (back-compat for any direct call).
+async function checkNSFW(base64Str, sharedTensor = null) {
   if (!nsfwModel) return null;
-  let rawTensor = null;
+  const ownTensor = !sharedTensor;
+  let rawTensor = sharedTensor;
   let uint8 = null;
   try {
-    rawTensor = decodeImageToTensor(base64Str);
+    if (!rawTensor) rawTensor = decodeImageToTensor(base64Str);
     // nsfwjs expects a [H, W, 3] uint8 tensor
     uint8 = tf.tidy(() => rawTensor.toInt().clipByValue(0, 255));
     const predictions = await nsfwModel.classify(uint8);
@@ -76,9 +84,10 @@ async function checkNSFW(base64Str) {
     console.error('[nsfw] Inference error:', e.message);
     return null; // fail open — never block due to NSFW model error
   } finally {
-    // Dispose both tensors here so a throw in classify() can't leak uint8.
+    // Dispose the uint8 copy always; dispose the raw tensor ONLY if we made it
+    // (a shared tensor is owned + disposed by the caller).
     if (uint8) tf.dispose(uint8);
-    if (rawTensor) tf.dispose(rawTensor);
+    if (ownTensor && rawTensor) tf.dispose(rawTensor);
   }
 }
 
@@ -292,7 +301,7 @@ function makeFileSystemHandler(modelDir) {
 // ---------------------------------------------------------------------------
 // Load the custom TFJS 4-class civic model
 // ---------------------------------------------------------------------------
-async function loadCivicModel() {
+async function loadCivicModelOnce() {
   const modelDir = path.join(ROOT_DIR, 'civic_model_tfjs');
   const modelJsonPath = path.join(modelDir, 'model.json');
 
@@ -300,36 +309,59 @@ async function loadCivicModel() {
     console.error('[civic] civic_model_tfjs/model.json not found.');
     console.error('        Run: python train_civic_model.py  — to train and export the model.');
     console.warn('[civic] Image validation will be SKIPPED until model is available.');
-    return;
+    return; // Missing artefact — NOT a backend fault, caller must not retry.
   }
 
+  console.log('[civic] Loading custom 4-class civic model from civic_model_tfjs/...');
+  const ioHandler = makeFileSystemHandler(modelDir);
+  // Detect format: layers-model uses loadLayersModel, graph-model uses loadGraphModel
+  const modelJsonRaw = JSON.parse(fs.readFileSync(modelJsonPath, 'utf8'));
+  const isLayersModel = modelJsonRaw.format === 'layers-model';
+  if (isLayersModel) {
+    console.log('[civic] Detected layers-model format, using tf.loadLayersModel()');
+    civicModel = await tf.loadLayersModel(ioHandler);
+  } else {
+    console.log('[civic] Detected graph-model format, using tf.loadGraphModel()');
+    civicModel = await tf.loadGraphModel(ioHandler);
+  }
+  // Warm up with a dummy tensor. This is also where an unsupported-op fault on a
+  // given backend surfaces (predict throws) — the caller uses that to fall back.
+  const dummy = tf.zeros([1, 224, 224, 3]);
+  const warmup = await runCivicModel(dummy);
+  // Detect a dual-output (logits + probs) head: predict returns an array of
+  // 2+ tensors. This unlocks energy OOD + temperature scaling.
+  HAS_LOGITS = warmup.length >= 2;
+  warmup.forEach(t => t && t.dispose && t.dispose());
+  dummy.dispose();
+  console.log(`[civic] Civic ${isLayersModel ? 'layers' : 'graph'} model loaded (backend=${tf.getBackend()}). Classes:`, CIVIC_CLASSES);
+  console.log('[civic] Logits head present:', HAS_LOGITS);
+  console.log('[civic] Thresholds:', CLASS_THRESHOLDS);
+  await runFixtureSelfTest();
+}
+
+async function loadCivicModel() {
   try {
-    console.log('[civic] Loading custom 4-class civic model from civic_model_tfjs/...');
-    const ioHandler = makeFileSystemHandler(modelDir);
-    // Detect format: layers-model uses loadLayersModel, graph-model uses loadGraphModel
-    const modelJsonRaw = JSON.parse(fs.readFileSync(modelJsonPath, 'utf8'));
-    const isLayersModel = modelJsonRaw.format === 'layers-model';
-    if (isLayersModel) {
-      console.log('[civic] Detected layers-model format, using tf.loadLayersModel()');
-      civicModel = await tf.loadLayersModel(ioHandler);
-    } else {
-      console.log('[civic] Detected graph-model format, using tf.loadGraphModel()');
-      civicModel = await tf.loadGraphModel(ioHandler);
-    }
-    // Warm up with a dummy tensor
-    const dummy = tf.zeros([1, 224, 224, 3]);
-    const warmup = await runCivicModel(dummy);
-    // Detect a dual-output (logits + probs) head: predict returns an array of
-    // 2+ tensors. This unlocks energy OOD + temperature scaling.
-    HAS_LOGITS = warmup.length >= 2;
-    warmup.forEach(t => t && t.dispose && t.dispose());
-    dummy.dispose();
-    console.log(`[civic] Civic ${isLayersModel ? 'layers' : 'graph'} model loaded. Classes:`, CIVIC_CLASSES);
-    console.log('[civic] Logits head present:', HAS_LOGITS);
-    console.log('[civic] Thresholds:', CLASS_THRESHOLDS);
-    await runFixtureSelfTest();
+    await loadCivicModelOnce();
   } catch (e) {
-    console.error('[civic] Failed to load civic model:', e.message);
+    // If the failure happened on WASM (e.g. an op the wasm kernel doesn't
+    // implement, or numeric drift failing the fixture self-test), drop to the
+    // pure-JS cpu backend and reload ONCE. A slower-but-correct classifier beats
+    // a disabled one — disabled means the fail-open path accepts everything.
+    if (tf.getBackend() === 'wasm') {
+      console.warn('[civic] Model load/warmup failed on WASM — retrying on cpu backend:', e.message);
+      try {
+        await tf.setBackend('cpu');
+        await tf.ready();
+        ACTIVE_BACKEND = 'cpu';
+        civicModel = null;
+        await loadCivicModelOnce();
+        return;
+      } catch (e2) {
+        console.error('[civic] cpu fallback also failed:', e2.message);
+      }
+    } else {
+      console.error('[civic] Failed to load civic model:', e.message);
+    }
     console.warn('[civic] Image validation will be SKIPPED until model is fixed.');
     civicModel = null;
   }
@@ -488,15 +520,16 @@ function preprocessForCivicModel(imageTensor) {
 //   logits     — raw logits object (or null for legacy softmax-only models).
 // When present, logits unlock the energy-based OOD score and temperature scaling.
 // ---------------------------------------------------------------------------
-async function classifyCivicImage(base64Str) {
+async function classifyCivicImage(base64Str, sharedTensor = null) {
   if (!civicModel) return null;
 
-  let rawTensor = null;
+  const ownTensor = !sharedTensor;
+  let rawTensor = sharedTensor;
   let inputTensor = null;
   let outTensors = [];
 
   try {
-    rawTensor = decodeImageToTensor(base64Str);
+    if (!rawTensor) rawTensor = decodeImageToTensor(base64Str);
     inputTensor = preprocessForCivicModel(rawTensor);
     // A dual-output logits model returns [logits, probs]; a legacy model
     // returns a single softmax tensor. Normalize both shapes.
@@ -554,8 +587,9 @@ async function classifyCivicImage(base64Str) {
 
     return { classProbs, rawProbs, logits };
   } finally {
-    // Always dispose tensors to prevent memory leaks
-    if (rawTensor) tf.dispose(rawTensor);
+    // Always dispose tensors to prevent memory leaks. The raw tensor is disposed
+    // ONLY when we decoded it here; a shared tensor belongs to the caller.
+    if (ownTensor && rawTensor) tf.dispose(rawTensor);
     if (inputTensor) tf.dispose(inputTensor);
     outTensors.forEach(t => t && t.dispose && t.dispose());
   }
@@ -736,7 +770,51 @@ function decideBlock(classProbs, declaredCategory, opts = {}) {
 // =============================================================================
 // PUBLIC API — routes/health call these; state stays encapsulated here.
 // =============================================================================
+// ---------------------------------------------------------------------------
+// TF backend selection. tfjs' default 'cpu' backend is pure-JS math — the
+// slowest path — so on a shared 0.1-CPU host a civic forward pass takes
+// ~90-140s. The WASM backend (SIMD) runs the same ops several times faster
+// with NO native binaries and NO build toolchain, and a small WASM heap that
+// fits the 512MB free tier. Try WASM first, FALL BACK to cpu on any failure —
+// correctness must never depend on the fast path: a broken backend would make
+// classifyCivicImage throw, and the fail-open layers would then wave every
+// upload through unchecked. Force the old path with TF_BACKEND=cpu.
+let ACTIVE_BACKEND = 'cpu';
+async function initBackend() {
+  const want = (process.env.TF_BACKEND || 'wasm').toLowerCase();
+  if (want !== 'wasm') {
+    try { await tf.setBackend('cpu'); await tf.ready(); } catch (_) { /* cpu is always present */ }
+    ACTIVE_BACKEND = tf.getBackend();
+    console.log(`[tf] Backend forced to '${ACTIVE_BACKEND}' (TF_BACKEND=${want}).`);
+    return ACTIVE_BACKEND;
+  }
+  try {
+    const wasm = require('@tensorflow/tfjs-backend-wasm');
+    // Point the backend at the .wasm binaries shipped in the package's dist/.
+    const distDir = path.dirname(require.resolve('@tensorflow/tfjs-backend-wasm'));
+    if (typeof wasm.setWasmPaths === 'function') {
+      wasm.setWasmPaths(distDir.endsWith(path.sep) ? distDir : distDir + path.sep);
+    }
+    const ok = await tf.setBackend('wasm');
+    await tf.ready();
+    ACTIVE_BACKEND = tf.getBackend();
+    if (!ok || ACTIVE_BACKEND !== 'wasm') {
+      throw new Error(`setBackend('wasm') returned ${ok}, active='${ACTIVE_BACKEND}'`);
+    }
+    console.log('[tf] WASM backend active (SIMD) — faster inference on shared CPU.');
+  } catch (e) {
+    console.error('[tf] WASM backend init failed — falling back to pure-JS cpu backend:', e.message);
+    try { await tf.setBackend('cpu'); await tf.ready(); } catch (_) { /* ignore */ }
+    ACTIVE_BACKEND = tf.getBackend();
+    console.warn(`[tf] Backend in use: '${ACTIVE_BACKEND}' (slower, but classification stays correct).`);
+  }
+  return ACTIVE_BACKEND;
+}
+
 async function loadAll() {
+  // Select the compute backend BEFORE any model loads — the backend a model is
+  // compiled against is fixed at load time, so switching after would be a no-op.
+  await initBackend();
   loadThresholds();
   // NSFW model is optional RAM-wise. On a memory-tight host that OOMs even with
   // CLIP off, DISABLE_NSFW=true drops nsfwjs (~saves headroom); adult-content
@@ -766,6 +844,7 @@ function getMeta() {
     ADVISORY_MODE,
     CIVIC_CLASSES,
     clipReady: othersClip.isReady(),
+    backend: ACTIVE_BACKEND,
   };
 }
 
@@ -773,6 +852,16 @@ function getMeta() {
 // use this instead of reading the module-scoped `civicModel` directly.
 function getCivicModel() {
   return civicModel;
+}
+
+// Decode a base64 image to a [H,W,3] tensor ONCE, so infer() can share it across
+// checkNSFW + classifyCivicImage instead of decoding the same JPEG/PNG twice.
+// Caller MUST dispose it (disposeTensor) — see infer.js.
+function decodeSharedTensor(base64Str) {
+  return decodeImageToTensor(base64Str);
+}
+function disposeTensor(t) {
+  if (t && t.dispose) { try { t.dispose(); } catch (_) { /* already disposed */ } }
 }
 
 module.exports = {
@@ -787,4 +876,6 @@ module.exports = {
   CIVIC_CLASSES,
   CATEGORY_TO_CLASS,
   TITLE_ROUTES,
+  decodeSharedTensor,
+  disposeTensor,
 };

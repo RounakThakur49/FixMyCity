@@ -69,13 +69,14 @@ app.post('/api/infer', requireMlKey, async (req, res) => {
 // -----------------------------------------------------------------------------
 app.get('/health', (req, res) => {
   try {
-    const { civicModel, nsfwModel, ADVISORY_MODE, CIVIC_CLASSES, clipReady } = pipeline.getMeta();
+    const { civicModel, nsfwModel, ADVISORY_MODE, CIVIC_CLASSES, clipReady, backend } = pipeline.getMeta();
     res.status(200).json({
       status: 'ok',
       service: 'ml',
       model_loaded: !!civicModel,
       nsfw_loaded: !!nsfwModel,
       clip_ready: !!clipReady,
+      backend: backend || 'unknown',
       enforce_mode: !ADVISORY_MODE,
       classes: CIVIC_CLASSES,
       classifier: 'custom-civic-4class-tfjs (EfficientNetV2S)',

@@ -22,6 +22,7 @@ router.get('/api/health', async (req, res) => {
       model_loaded: !!m.civicModel,
       nsfw_loaded: !!m.nsfwModel,
       clip_ready: !!m.clipReady,
+      backend: m.backend || 'unknown',
       enforce_mode: !m.ADVISORY_MODE,
       classes: m.CIVIC_CLASSES,
       classifier: m.civicModel ? 'custom-civic-4class-tfjs' : 'no model loaded',
