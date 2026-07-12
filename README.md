@@ -8,7 +8,7 @@ FixMyCity is a **3-tier application**:
 
 - **Frontend** (`frontend/`) — React 19 (CRA) SPA, deployed to Vercel. Talks only to the backend.
 - **Backend** (`backend/`) — Express + MongoDB + JWT API. Lightweight (no ML deps); handles auth, CRUD, and proxies image validation to the ML service.
-- **ML service** (`ml-service/`) — standalone Express inference service (EfficientNetV2S civic classifier + NSFW moderation + CLIP), deployed to Hugging Face Spaces. Called server-to-server by the backend.
+- **ML service** (`ml-service/`) — standalone Express inference service (EfficientNetV2S civic classifier + NSFW moderation + CLIP), deployed on an Oracle Cloud A1 VM (primary) or co-run inline on Render (fallback). Called server-to-server by the backend.
 
 ---
 
@@ -204,20 +204,24 @@ Each tier has its own `.env.example` — copy it to `.env` for local dev, or set
 
 | Var | Purpose |
 |-----|---------|
-| `PORT` | Listen port. **Hugging Face Spaces requires 7860.** |
+| `PORT` | Listen port. Default **7860**; on Oracle it's the localhost bind (backend calls `http://localhost:7860`). |
 | `ML_KEY` | Shared secret. When set, `POST /api/infer` requires header `X-ML-KEY: <ML_KEY>`. Blank → endpoint open (local dev only). |
 
 ---
 
 ## Deployment
 
-Deploy each tier independently:
+**Primary (recommended, full pipeline, free forever):**
 
-- **ML service** → Hugging Face Spaces (Docker, port 7860, 16GB free tier)
-- **Backend** → Render (or HF) — `backend/render.yaml` is provided
-- **Frontend** → Vercel
+- **Oracle Cloud Ampere A1 Always-Free VM** (ARM64, up to 4 OCPU / 24 GB, always-on) runs **both** backend `:5000` + ML service `:7860` as a real split (back→ml over localhost), with **civic + NSFW + CLIP all ON** and inference in a few seconds. Card required at signup for ID only (tier is $0). See **[`ORACLE_DEPLOY.md`](./ORACLE_DEPLOY.md)** + the ready `ml-service/deploy-oracle.sh`.
+- **Frontend** → Vercel.
 
-See **[`DEPLOY.md`](./DEPLOY.md)** for the full step-by-step runbook (order, secrets, CORS wiring, verification).
+**Fallback (no card, but RAM-constrained):**
+
+- **Backend + ML co-run on one Render free service** (in-process, `ML_INLINE=true`) — the repo-root **`render.yaml`** blueprint is provided. Render's 512 MB forces `DISABLE_CLIP=true` (and optionally `DISABLE_NSFW=true`), so only the civic classifier stays active and inference is slow (~90–140 s on 0.1 vCPU). See **[`DEPLOY.md`](./DEPLOY.md)**.
+- Also possible: ML service on a separate host (Docker) in HTTP mode.
+
+Both deploys are decoupled by env — nothing in code is host-specific.
 
 > **Gotcha:** CRA bakes `REACT_APP_*` into the JS bundle at **build time**. After changing `REACT_APP_API_URL` on Vercel you must trigger a **redeploy** — a plain env edit does nothing until the next build.
 
@@ -256,7 +260,6 @@ FixMyCity/
 │   ├── aadhaar.js                  # Verhoeff validation (shared w/ frontend)
 │   ├── models/                     # Mongoose schemas (User, Admin, Complaint, Review)
 │   ├── .env.example                # MONGO_URI, JWT_SECRET, CORS_ORIGIN, ML_SERVICE_URL, ML_KEY
-│   ├── render.yaml                 # Render deploy config
 │   ├── train_civic_model.py        # EfficientNetV2S 3-stage training
 │   ├── temperature_scaling.py      # Post-training threshold calibration
 │   ├── audit_dataset.py            # Dataset quality audit
@@ -267,15 +270,16 @@ FixMyCity/
 │       ├── streetlight/ (~1,640)
 │       ├── drainage/   (~1,101)
 │       └── others/     (~1,235)
-├── ml-service/                     # STANDALONE inference microservice (HF Spaces)
+├── ml-service/                     # STANDALONE inference microservice
 │   ├── server.js                   # Express: POST /api/infer (X-ML-KEY), GET /health
-│   ├── infer.js                    # per-image pipeline entrypoint
-│   ├── ml/pipeline.js              # NSFW + civic classifier + OOD + CLIP
+│   ├── infer.js                    # per-image pipeline entrypoint (decode-once)
+│   ├── ml/pipeline.js              # NSFW + civic classifier + OOD + CLIP + TF_BACKEND
 │   ├── others_clip.js              # CLIP open-set classifier for "Others"
 │   ├── civic_model_tfjs/           # TFJS-converted model (loaded at runtime)
 │   ├── civic_thresholds.json       # Calibrated thresholds + OOD config
 │   ├── civic_exemplars.json        # CLIP exemplar embeddings for "Others"
-│   ├── Dockerfile                  # HF Spaces build (port 7860)
+│   ├── Dockerfile                  # container build (port 7860)
+│   ├── deploy-oracle.sh            # Oracle A1 one-shot split setup (Node 20 + pm2)
 │   ├── .env.example                # PORT=7860, ML_KEY
 │   └── README.md                   # ML service docs
 ├── frontend/
@@ -295,7 +299,9 @@ FixMyCity/
 │   │       └── Timeline.jsx
 │   └── public/
 ├── tests/e2e/                      # Playwright suite
-├── DEPLOY.md                       # Full deployment runbook (HF + Render + Vercel)
+├── render.yaml                     # Render blueprint (fallback deploy, repo root)
+├── ORACLE_DEPLOY.md                # PRIMARY deploy runbook (Oracle A1, full pipeline)
+├── DEPLOY.md                       # Render/fallback deployment runbook
 ├── CLAUDE.md                       # AI assistant instructions + roadmap
 └── README.md                       # This file
 ```
