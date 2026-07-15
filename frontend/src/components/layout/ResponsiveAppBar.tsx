@@ -97,6 +97,19 @@ function BrandLockup({ compact = false }: { compact?: boolean }) {
                         objectFit: 'contain',
                     }}
                 />
+                <Typography
+                    sx={{
+                        ml: 1,
+                        mr: 0.5,
+                        fontSize: compact ? '1.1rem' : '1.25rem',
+                        fontWeight: 700,
+                        color: '#0f766e',
+                        whiteSpace: 'nowrap',
+                        userSelect: 'none',
+                    }}
+                >
+                    FixMyCity
+                </Typography>
             </Box>
         );
     }
