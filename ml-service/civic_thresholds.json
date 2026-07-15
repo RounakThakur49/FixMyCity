@@ -7,15 +7,15 @@
     "potholes",
     "streetlight"
   ],
-  "temperature": 0.5736,
+  "temperature": 0.4165,
   "calibration_warning": null,
-  "val_accuracy_uncalibrated": 0.9683,
-  "val_accuracy_calibrated": 0.9683,
-  "val_macro_f1": 0.952,
+  "val_accuracy_uncalibrated": 0.9756,
+  "val_accuracy_calibrated": 0.9756,
+  "val_macro_f1": 0.975,
   "logits_source": "head",
   "thresholds": {
-    "drainage": 0.063,
-    "potholes": 0.0,
+    "drainage": 0.002,
+    "potholes": 0.005,
     "streetlight": 0.0
   },
   "reliable": {
@@ -25,36 +25,36 @@
   },
   "ood": {
     "method": "energy",
-    "temperature": 0.5736,
-    "energy_threshold": -2.296379,
-    "entropy_threshold": 0.639213,
+    "temperature": 0.4165,
+    "energy_threshold": -2.123187,
+    "entropy_threshold": 0.503279,
     "percentile": 95,
-    "energy_in_dist_mean": -7.094334,
-    "energy_in_dist_std": 3.0991,
-    "entropy_in_dist_mean": 0.106972,
-    "entropy_in_dist_max": 1.227911
+    "energy_in_dist_mean": -5.060707,
+    "energy_in_dist_std": 1.928437,
+    "entropy_in_dist_mean": 0.073892,
+    "entropy_in_dist_max": 1.092079
   },
   "per_class_metrics": {
     "drainage": {
-      "threshold": 0.063,
-      "precision": 0.7037,
-      "recall": 0.9896,
-      "f1": 0.8225,
-      "n_samples": 96
+      "threshold": 0.002,
+      "precision": 0.7008,
+      "recall": 0.997,
+      "f1": 0.8231,
+      "n_samples": 336
     },
     "potholes": {
-      "threshold": 0.0,
-      "precision": 0.7002,
+      "threshold": 0.005,
+      "precision": 0.7009,
       "recall": 1.0,
-      "f1": 0.8237,
-      "n_samples": 376
+      "f1": 0.8241,
+      "n_samples": 410
     },
     "streetlight": {
       "threshold": 0.0,
-      "precision": 0.701,
+      "precision": 0.7008,
       "recall": 1.0,
-      "f1": 0.8242,
-      "n_samples": 436
+      "f1": 0.8241,
+      "n_samples": 417
     }
   }
 }

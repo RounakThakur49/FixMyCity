@@ -48,6 +48,8 @@ services:
         value: "true"          # run ML in-process (single free service)
       - key: DISABLE_CLIP
         value: "true"          # skip CLIP → fit 512MB (Others → keyword fallback)
+      # DISABLE_NSFW: set to "true" to skip NSFW model (~95MB saved, ~3-8s faster
+      # per image). Leave unset to keep content moderation active.
       - key: ML_TIMEOUT_MS
         value: "120000"        # generous; shared-CPU tfjs inference is slow
       - key: MONGO_URI

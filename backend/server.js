@@ -44,6 +44,7 @@ app.use(require('./routes/stats'));
 app.use(require('./routes/auth'));
 app.use(require('./routes/complaints'));
 app.use(require('./routes/reviews'));
+app.use(require('./routes/superadmin'));
 
 // =============================================================================
 // GLOBAL ERROR HANDLER
@@ -83,21 +84,7 @@ const server = app.listen(PORT, () => {
   // Either way missing/unreachable ML → complaints still save (fail-open).
   const { ML_INLINE, initInline } = require('./mlInline');
   if (ML_INLINE) {
-    // ORDERING IS LOAD-BEARING on a single shared-CPU box. Loading the pure-JS
-    // tfjs civic model decodes ~41MB of weights + warms up, blocking the event
-    // loop for ~90s. The MongoDB Atlas TLS handshake (secureConnect) needs
-    // event-loop turns to finish; if the model load hogs the loop first, the
-    // handshake starves past its timeout and the INITIAL mongoose connect fails
-    // — and mongoose never retries an initial connect, so every read then
-    // buffer-times-out until a restart. Await the DB connect settling BEFORE
-    // warming ML so the handshake gets its window. (initInline stays fail-open,
-    // so complaints still save even if the model load errors after this.)
-    dbReady.then(() => {
-      console.log('[ml] ML_INLINE=true — loading pipeline in-process...');
-      return initInline();
-    })
-      .then(() => console.log('[ml] In-process pipeline ready.'))
-      .catch(e => console.error('[ml] In-process load error (continuing, fail-open):', e.message));
+    console.log('[ml] ML_INLINE=true — will load pipeline lazily on first request.');
   } else if (ML_SERVICE_URL) {
     console.log(`[ml] Image validation delegated to ML service: ${ML_SERVICE_URL}`);
   } else {

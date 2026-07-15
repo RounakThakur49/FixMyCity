@@ -79,10 +79,11 @@ router.get('/api/complaints', async (req, res) => {
   try {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
+    if (req.query.citizenPhone) filter.citizenPhone = req.query.citizenPhone;
 
     const paginated = req.query.page !== undefined || req.query.limit !== undefined;
     if (!paginated) {
-      const complaints = await Complaint.find(filter).sort({ updatedAt: -1 });
+      const complaints = await Complaint.find(filter).select('-image -images').sort({ updatedAt: -1 });
       return res.status(200).json(complaints);
     }
 
@@ -91,7 +92,7 @@ router.get('/api/complaints', async (req, res) => {
     const skip = (page - 1) * limit;
 
     const [data, total] = await Promise.all([
-      Complaint.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limit),
+      Complaint.find(filter).select('-image -images').sort({ updatedAt: -1 }).skip(skip).limit(limit),
       Complaint.countDocuments(filter),
     ]);
 
@@ -246,12 +247,34 @@ router.post('/api/complaints', requireAuth, complaintLimiter, async (req, res) =
 // Validate complaint ID format
 const COMPLAINT_ID_RE = /^CMP-\d+$/;
 
-router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
+// GET /api/complaints/:id
+// Returns single complaint details + status updates (for details panel compatibility)
+router.get('/api/complaints/:id', async (req, res) => {
   try {
     if (!COMPLAINT_ID_RE.test(req.params.id)) {
       return res.status(400).json({ message: 'Invalid complaint ID format.' });
     }
-    const { status, forwardedTo } = req.body;
+    const complaint = await Complaint.findOne({ id: req.params.id });
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found.' });
+
+    res.status(200).json({
+      success: true,
+      complaint,
+      statusUpdates: complaint.updates || [],
+    });
+  } catch (e) {
+    console.error('Get complaint detail error:', e);
+    res.status(500).json({ message: 'Failed to retrieve complaint details.' });
+  }
+});
+
+router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
+  try {
+    console.log('[PATCH status] id:', req.params.id, 'body:', JSON.stringify(req.body));
+    if (!COMPLAINT_ID_RE.test(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid complaint ID format.' });
+    }
+    const { status, forwardedTo, title, description } = req.body;
     if (!status) return res.status(400).json({ message: 'Status field is required.' });
     const VALID_STATUSES = ['Submitted', 'In Review', 'Forwarded', 'Resolved'];
     if (!VALID_STATUSES.includes(status)) {
@@ -263,22 +286,28 @@ router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
 
     const timestamp = getFormattedDate();
     let note = '';
-    switch (status) {
-      case 'In Review': note = 'Area inspection requested by admin.'; break;
-      case 'Forwarded': note = `Issue forwarded to ${forwardedTo || 'respective department'}.`; break;
-      case 'Resolved':  note = 'Complaint resolved successfully.'; break;
-      default:          note = `Status updated to ${status}.`;
+    if (title || description) {
+      note = [title, description].filter(Boolean).join(' — ');
+    } else {
+      switch (status) {
+        case 'In Review': note = 'Area inspection requested by admin.'; break;
+        case 'Forwarded': note = `Issue forwarded to ${forwardedTo || 'respective department'}.`; break;
+        case 'Resolved':  note = 'Complaint resolved successfully.'; break;
+        default:          note = `Status updated to ${status}.`;
+      }
     }
 
     complaint.status = status;
     if (forwardedTo !== undefined && forwardedTo !== '') complaint.forwardedTo = forwardedTo;
     complaint.updatedAt = timestamp;
+    if (!complaint.citizenName) complaint.citizenName = 'Unknown';
+    if (!complaint.citizenPhone) complaint.citizenPhone = 'unknown';
     complaint.updates.push({ label: status, note, at: timestamp });
     await complaint.save();
     res.status(200).json(complaint);
   } catch (e) {
-    console.error('Update status error:', e);
-    res.status(500).json({ message: 'Failed to update complaint status.' });
+    console.error('Update status error:', e.message, e.errors ? JSON.stringify(e.errors) : '');
+    res.status(500).json({ message: 'Failed to update complaint status.', detail: e.message });
   }
 });
 

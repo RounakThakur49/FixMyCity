@@ -10,7 +10,8 @@ const helmetMiddleware = helmet({
 });
 
 // CORS — restrict to known frontend origins (override via CORS_ORIGIN env var)
-const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:3000')
+// Defaults include both Vite dev server (5173) and legacy CRA (3000)
+const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://localhost:3000')
   .split(',')
   .map(o => o.trim());
 const corsMiddleware = cors({

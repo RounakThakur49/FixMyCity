@@ -6,11 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 FixMyCity is a civic complaint platform. Citizens register, file complaints about pothole / drainage / streetlight / other issues (with photo proof), and track status; admins review complaints, forward them to municipal departments, and resolve them. It has three independently-run tiers:
 
-- **Frontend** (`frontend/`): Create React App (React 19) served on port 3000.
-- **Backend** (`backend/`): Express + MongoDB (Mongoose) + JWT API on port 5000. **No ML dependencies of its own** — image validation is delegated to the ML pipeline. Two modes: (1) **HTTP** — call a separate `ml-service` over HTTP (`POST ${ML_SERVICE_URL}/api/infer`); (2) **in-process** (`ML_INLINE=true`) — load the sibling `ml-service` pipeline in the SAME process and call `infer()` directly, for a single co-run deploy (e.g. one Render free service). Fail-open either way if ML is unavailable.
+- **Frontend** (`frontend/`): React 19 + TypeScript + Vite 8 SPA with MUI 9 + Redux/Saga. Dev server on port 5173 (Vite proxy to :5000).
+- **Backend** (`backend/`): Express + MongoDB (Mongoose) + JWT API on port 5000. **No ML dependencies of its own** — image validation is delegated to the ML pipeline. Three roles: `citizen`, `admin`, `superadmin` (with email OTP 2FA). Two ML modes: (1) **HTTP** — call a separate `ml-service` over HTTP (`POST ${ML_SERVICE_URL}/api/infer`); (2) **in-process** (`ML_INLINE=true`) — load the sibling `ml-service` pipeline in the SAME process and call `infer()` directly, for a single co-run deploy (e.g. one Render free service). Fail-open either way if ML is unavailable.
 - **ML service** (`ml-service/`): the entire multi-stage ML pipeline (custom EfficientNetV2S civic classifier + NSFW content moderation + CLIP open-set classifier) as a standalone folder. Runs as its own Express service on port 7860 (HTTP mode), OR is required in-process by the backend (`ML_INLINE` mode). `DISABLE_CLIP=true` skips the ~150MB CLIP model and `DISABLE_NSFW=true` skips the ~95MB nsfwjs model to fit memory-tight free tiers (512MB) — "Others" then uses keyword fallback; civic classifier always stays active. **Deploy targets: Oracle Cloud A1 Always-Free VM as the PRIMARY (real split, 24GB, full pipeline ON — see `ORACLE_DEPLOY.md`); Render free as a fallback (in-process, RAM-constrained).** A `TF_BACKEND` env selects the tfjs compute backend (`wasm` attempted first, auto-falls-back to `cpu`); the current graph-model's fused-conv ops (rank-4 bias) aren't WASM-supported, so it runs `cpu` until either a native `tfjs-node` build or a re-export to layers-model — the fallback is transparent and keeps classification correct.
 
-These are separate npm packages with separate `package.json` and `node_modules`. The CRA dev server proxies API calls to `http://localhost:5000` via the `"proxy"` field in `frontend/package.json`.
+These are separate npm packages with separate `package.json` and `node_modules`. The Vite dev server proxies `/api/*` calls to `http://localhost:5000` via `vite.config.ts`.
 
 ## Commands
 
@@ -18,10 +18,9 @@ Frontend (run from `frontend/`):
 ```bash
 cd frontend
 npm install
-npm start                 # dev server on :3000
-npm run build             # production build to /build
-npm test                  # interactive Jest watch mode
-npm test -- --watchAll=false src/App.test.js   # run a single test file once (CI-style)
+npm run dev               # Vite dev server on :5173
+npm run build             # production build to /dist
+npx tsc --noEmit          # type-check (no emit)
 ```
 
 Backend (run from `backend/`):
@@ -142,17 +141,11 @@ The backend applies the verdict as-is: `block` → `res.status(verdict.httpStatu
 
 **In-process mode (`ML_INLINE=true`, `backend/mlInline.js`):** for a single co-run deploy (e.g. one Render free service — 750hr/mo + 512MB), the backend loads the sibling `ml-service` pipeline into its OWN process (`require('../ml-service/ml/pipeline')` + `require('../ml-service/infer')`) and calls `infer()` directly — no HTTP hop, no `ML_KEY`. `server.js` warms the models at boot (`initInline()`) — **after** `connectDB()` settles, so the ~90s pure-JS tfjs weight-decode can't starve the Atlas TLS handshake and fail the initial connect; `routes/complaints.js` and `routes/health.js` route through `mlInline.js` instead of HTTP. Pair with `DISABLE_CLIP=true` (measured peak ≈280MB combined, well under 512MB). The `render.yaml` (repo root — NOT `rootDir:backend`, which would hide the sibling `ml-service` folder from the require) installs both folders' deps and sets `ML_INLINE=true DISABLE_CLIP=true`, and does **NOT** set a `healthCheckPath` (Render's 5s HTTP health check would time out during a 25-60s blocking inference and restart the instance mid-request → crashloop; TCP port-bind liveness is used instead). This is the **Render-fallback** config; the real **split** (Oracle, or any two-host deploy) uses the standalone HTTP service (`ml-service/server.js`) with `ML_SERVICE_URL` + `ML_KEY` and `ML_INLINE` unset.
 
-### State lives in App.js
-`frontend/src/App.js` is the single source of truth for the entire frontend. It holds **all** state (session, complaints list, all form state, selection, `complaintError`) and **all** handlers (auth, complaint CRUD, image compression). Every component is presentational — they receive state and callbacks as props and render nothing on their own. There is no router, no global store, and no component-level data fetching. View switching is driven by `session.role`:
-
-- no session → `Hero` (landing + login/register forms)
-- `citizen` → `CitizenDashboard` (file + track complaints)
-- `admin` → `AdminDashboard` (review, forward, resolve, delete)
-
-When adding a feature, expect to add state + a handler in `App.js` and thread them down as props. Match this pattern rather than introducing local fetching or state in child components.
+### State management (Redux + Saga, July 2026 migration)
+State moved from the App.js monolith to **Redux slices** (`actions/auth.slice.ts`, `citizen.slice.ts`, `admin.slice.ts`) with **redux-saga** handling async flows (API calls). `App.tsx` is now a thin view-router that reads `auth.user.role` from the Redux store and renders the appropriate dashboard. API calls live in `apis/functions.ts` — an axios interceptor auto-attaches the JWT Bearer token from `sessionStorage`. Components dispatch actions (e.g. `fetchUserHomeRequest`) and sagas handle the async flow (call API → dispatch success/error). When adding features, add an action+reducer+saga, not state in App.tsx.
 
 ### Session + JWT auth (server-enforced since July 2026)
-Login/register return a signed **JWT** (`token`) alongside the user object. The frontend keeps both in the `session` object, persisted to `localStorage` under `fixmycity-session`. On every **write** the frontend attaches `Authorization: Bearer <token>` (see `authHeaders()` in `App.js`); **reads stay public**. The backend verifies the token in `requireAuth`/`requireAdmin` middleware (`server.js`) — role checks are now server-side, not just the client-side `requiredRole` gate. `update-profile` trusts only `req.auth.sub` for identity (never a body `id`/`userId`). A 401 on any write clears the session and forces re-login (`handleExpiredSession`). Set `JWT_SECRET` in the host env. See "Security posture → Applied hardening" for the full route matrix.
+Login/register return a signed **JWT** (`token`) alongside the user object. The frontend stores the token in `sessionStorage` under `fmc_token` and the user object under `user`. An axios interceptor in `axios.baseClient.ts` auto-attaches `Authorization: Bearer <token>` on every request. The backend verifies the token in `requireAuth`/`requireAdmin`/`requireSuperAdmin` middleware — role checks are server-side. `update-profile` trusts only `req.auth.sub` for identity (never a body `id`/`userId`). A 401 response triggers logout. Set `JWT_SECRET` in the host env.
 
 ### Complaints list — pagination (back-compat, July 2026)
 `GET /api/complaints` (`routes/complaints.js`) is **back-compat by design**: with no query params it returns the full array (the shape the current frontend/Vercel build depends on). With `?page`/`?limit` it returns a paginated envelope `{ data, page, limit, total, totalPages }` (limit capped at 200, default 50); `?status=<enum>` filters via the status index. This is the scalability path — the deployed frontend still uses the array response; new/updated clients opt into pagination. Wiring the frontend to consume pages is the next step (see roadmap).
@@ -161,7 +154,30 @@ Login/register return a signed **JWT** (`token`) alongside the user object. The 
 Complaints are keyed throughout by a custom `id` field (`CMP-2401`, `CMP-2402`, …), **not** Mongo's `_id`. New IDs are generated in the create route by parsing the max existing CMP-XXXX serial and incrementing, with an E11000 retry loop for race-condition safety. All API routes (`/api/complaints/:id/status`, `DELETE /api/complaints/:id`) and all frontend lookups match on this `id`. Timestamps (`createdAt`, `updatedAt`, `updates[].at`) are stored as preformatted **strings** in `Asia/Kolkata` time (see `getFormattedDate`), not Date objects — sorting and display rely on the `YYYY-MM-DD HH:mm` lexical format.
 
 ### Status workflow + timeline
-A complaint moves `Submitted → In Review → Forwarded → Resolved` (enum in `models/Complaint.js`). The status PATCH route auto-appends an entry to the `updates[]` array with a canned note per status; the frontend `Timeline` component renders this array. `forwardedTo` names a municipal department (`authorityOptions` in `App.js`).
+A complaint moves `Submitted → In Review → Forwarded → Resolved` (enum in `models/Complaint.js`). The status PATCH route auto-appends an entry to the `updates[]` array with a canned note per status; the frontend `complaintDetails.tsx` renders this as a timeline with status badges. `forwardedTo` names a municipal department.
+
+### Super admin system (July 2026)
+A hard-coded `superadmin` role sits above `admin`. Seeded at boot from env vars (`SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD`). Login requires **email OTP 2FA** sent via **Brevo SMTP** (`BREVO_SMTP_USER` + `BREVO_API_KEY` must be set in production; in dev without creds, OTP prints to console). No hardcoded OTP bypass — all OTPs are cryptographically generated and bcrypt-verified.
+
+**Backend routes** (`routes/superadmin.js`, all gated by `requireSuperAdmin`):
+- `GET /api/superadmin/stats` — complaint analytics (by status, location hotspot, category, longest pending)
+- `GET /api/superadmin/admins` — list all regular admins
+- `POST /api/superadmin/admins` — create new admin (name, username, email, phone, password)
+- `DELETE /api/superadmin/admins/:id` — delete admin (cannot self-delete or delete superadmin)
+- `GET /api/superadmin/admins/:id/activity` — admin activity log (derived from complaint `updates[]`)
+- `GET /api/superadmin/citizens` — paginated citizen list
+- `GET /api/superadmin/citizens/:id/activity` — citizen complaint history
+
+**Frontend** (`useage.tsx`): analytics dashboard with bar chart, max-complaint location map, user management tabs (Admins/Citizens), activity log dialogs, Create Admin dialog, Delete Admin / Block Citizen actions.
+
+### Frontend architecture (Vite + Redux, July 2026 migration)
+Frontend migrated from CRA (App.js monolith) to **Vite 8 + TypeScript + MUI 9 + Redux/Saga**. State management moved from App.js props to Redux slices (`auth`, `citizen`, `admin`). API calls in `apis/functions.ts` with `axios` interceptor auto-attaching Bearer JWT. Field-name normalization in `normalizeComplaint()` bridges backend field names (`type`/`image`/`location`) to fork UI field names (`issueType`/`photoUrl`/`locationUrl`).
+
+View routing driven by Redux `auth.user.role`:
+- no user → `TabGroup` (Login/Register)
+- `citizen` → `UserHome` (complaints tracker + register complaint)
+- `admin` → `AdminHome` (all complaints + map + status update)
+- `superadmin` → `AdminHome` + `Useage` (analytics + user management, toggled via navbar)
 
 ### Civic image classifier (custom EfficientNetV2S, 4-class)
 `POST /api/complaints` delegates the uploaded photo to the **ML service** (`callMlInfer()` → `POST ${ML_SERVICE_URL}/api/infer`); the pipeline below **executes in `ml-service/`, not in the backend process**. The stages and technical details are unchanged by the split:
@@ -180,10 +196,10 @@ A complaint moves `Submitted → In Review → Forwarded → Resolved` (enum in 
 
 The classifier **fails open at two layers** (see the ML service section): the service degrades to `accept` on any model/inference fault, and the backend saves the complaint anyway if the service is unreachable. Advisory text is stored on the `imageCheck` subdocument (the backend stamps its `at` timestamp) and shown to admins.
 
-Images are sent inline as base64 in the JSON body (hence the `50mb` body limit); the frontend compresses them client-side in `compressImage` (800×800, JPEG 70% quality) before upload.
+Images are sent inline as base64 in the JSON body (hence the `50mb` body limit); the frontend compresses them client-side in `compressImage` (800×800, JPEG 70% quality, canvas-based, with raw-readAsDataURL fallback) before upload. This reduces typical phone photos from 3-5MB to ~60-120KB, cutting upload time and ML decode overhead.
 
 ### Database seeding
-On connect, `seedDatabase()` inserts default users and complaints **only if the collections are empty**. Seeded credentials: admin `admin@fixmycity` / `rounak123`; citizens `9876543210` and `9123456780`, both password `citizen123`. Passwords are bcrypt-hashed; `aadhar` is unique so each user must have a distinct one.
+On connect, `seedDatabase()` inserts default users and complaints **only if the collections are empty**. Superadmin uses `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` env vars. Seeded admin and citizen accounts are defined in `backend/db/seed.js`. Passwords are bcrypt-hashed; `aadhar` is unique so each user must have a distinct one. See `CREDENTIALS.local.md` (gitignored) for actual login values.
 
 ### Database indexes
 `Complaint` model has indexes on `updatedAt` (desc), `status`, and `citizenPhone` to support the common query patterns (list sorted by recent, filter by status, lookup by citizen). `Review` model indexes `createdAt` (desc). Without these, MongoDB would full-scan + in-memory sort, hitting the 32MB sort cap past ~tens of thousands of documents.
@@ -220,7 +236,7 @@ In `ml-service/` (runtime, loaded by the inference service):
 > **CRITICAL FIX (July 2026):** `decideBlock()` read thresholds with `||`, which treats a calibrated `0.0` as falsy and silently reverted potholes/streetlight to stale `0.45/0.40` defaults — hard-blocking the exact domain-gap citizen photos the V2S retrain set `0.0` to accept. Fixed to `??` in `decideBlock()`'s RULE1 (`declaredProb`/`threshold` lookups; now in `ml-service/ml/pipeline.js`). Verified: correct-category clean images now accept (201); junk/cross-category still block (422).
 
 ### Known ML limitations
-- **Dataset contamination (CRITICAL, found July 2026)**: ~30% of training images are junk — NSFW anime, fashion photos, TV posters, puppies, cricket matches, video game screenshots. Contaminated prefixes: `drain_*` (193), `scrape_*` (1086 across drainage+others), `bing_*` (20 drainage), `oth_*` (all ~350), `kag_*` (12 others). Clean sources: `nst_dr_image_*` (drainage), `kag_*`/`kg_potholes_*`/`nst_ph_*` (potholes), `kg_streetlight_*`/`nst_sl_*` (streetlight). **Must run cleanup before retraining** — see `FixMyCity_Colab_Train.ipynb` cell 4b.
+- **Dataset contamination (CRITICAL, found July 2026)**: ~30% of training images are junk — NSFW anime, fashion photos, TV posters, puppies, cricket matches, video game screenshots. Contaminated prefixes: `drain_*` (193), `scrape_*` (1086 across drainage+others), `bing_*` (20 drainage), `oth_*` (all ~596), `kag_*` (12 others). Clean sources: `nst_dr_image_*` (drainage, 441 clean), `kag_*`/`kg_potholes_*`/`nst_ph_*` (potholes, all 1578 clean), `kg_streetlight_*`/`nst_sl_*` (streetlight, all 1640 clean). **Contamination by folder**: drainage 60% junk (660/1101), others 100% junk (1235/1235), potholes 0%, streetlight 0%. **Current model works despite contamination** (F1=0.952) — but retraining on cleaned data recommended. **Must run cleanup before retraining** — see `FixMyCity_Colab_Train.ipynb` cell 4b.
 - **"Others" category empty after cleanup**: All 1,235 images were junk. Rebuilt from TACO trash dataset (CC BY 4.0) + manual curation needed. Target: 400+ real civic issue images (garbage, broken benches, fallen trees, debris).
 - **Domain gap**: Training images from Kaggle/Bing may not fully represent citizen phone photos (different lighting, angles, compression). **Mitigation**: Colab notebook includes JPEG compression artifact simulation augmentation; add 100-200 diverse phone photos per category before retraining.
 - **Drainage weakness**: Lowest F1 (0.78) due to visual similarity with potholes (road/asphalt textures). Tightened RULE2 margin for potholes↔drainage pair (0.05 vs global 0.12).
@@ -267,19 +283,30 @@ In `ml-service/` (runtime, loaded by the inference service):
 
 ## Notes
 
-- All API requests from the frontend send an `ngrok-skip-browser-warning: true` header — the app is intended to be tunneled via ngrok for demos. `API_BASE_URL` can be overridden with `REACT_APP_API_URL`.
-- The MongoDB instance is local-standalone or Atlas; there is no migration tooling — schema changes take effect on next write.
+- The frontend uses Vite's dev proxy (`vite.config.ts`) to forward `/api/*` to `http://localhost:5000`. No `REACT_APP_API_URL` needed in dev.
+- The MongoDB instance is local-standalone or Atlas. **Migration scripts** exist in `backend/`: `smart_migrate.js` imports data from two previous fork MongoDB clusters into the current system (translates field names, hashes passwords, builds `updates[]` timeline from separate `statuses` collection, resolves photos to base64). Run with `node smart_migrate.js` (or `--dry-run` to preview).
 - TFJS-Node native bindings are NOT used. Pure-JS tfjs is slower but works on any Node 20 environment without C++ toolchain.
-- HTML5 `required` attributes block empty-field submission for Title / Location / Description.
-- Admin actions: per-complaint Approve / Forward / Solve / Delete buttons live in the detail panel. Solve immediately bumps `resolved` counter and updates timeline. Forward requires a department selection (see `authorityOptions` in `App.js`).
-- Frontend CSS has three layered design systems in App.css (~7,700 lines) — a consolidation pass is needed. See UI/UX audit notes.
-- Toast component exists but is unused; frontend still uses `alert()`/`confirm()`.
-- User dropdown (sign out, edit profile) is hover-only — no keyboard/touch access. (Profile-edit modal itself now closes on Escape + has `role="dialog"`/`aria-modal`; dropdown trigger still needs keyboard support.)
+- Admin actions: per-complaint Details + Update Status buttons in the admin dashboard. Status update appends to `updates[]` timeline. Forward requires a department selection.
+- Frontend styles are MUI `sx` prop + theme tokens (defined in `main.tsx`). The old CRA CSS architecture (3 design systems in App.css) was replaced during the Vite migration.
+- User dropdown is hover-only — no keyboard/touch access. Profile dialog works (Escape to close, `role="dialog"`/`aria-modal`).
 
 ### Bug fixes (July 2026)
+- **Complaint card images broken** — `userHome.tsx` and `adminHome.tsx` blindly prepended `/photo/` to `photoUrl`, which could be a full URL or base64 data URI. Fixed: now checks prefix (`data:`/`http`/`blob:`) and only prepends `/photo/` for MongoDB photo IDs.
+- **Create Admin dialog missing** — `useage.tsx` had state/handlers for creating admins but no Dialog JSX or trigger button rendered. Fixed: added "+ Create Admin" button + form dialog.
+- **Admin activity log empty** — no backend endpoint existed and frontend returned empty array for admin role. Fixed: added `GET /api/superadmin/admins/:id/activity` (derives activity from complaint `updates[]` entries) and wired the frontend to call it.
 - **Edit Profile was fully broken** — `Header.jsx` sent `{id, aadhar, ...}` but the route read `userId`, and it re-validated the *masked* `XXXX XXXX 1234` aadhar against `/^\d{12}$/` → every save 400'd before reaching the server. Fixed: identity now comes from the JWT (no id in body), aadhar is immutable/read-only (not sent, not validated). Payload is `{name, phone, email}`.
 - **Live GPS location never stored** — `GoogleMap.handleGeolocate` only called `onChangeLocation` *inside* `if (isLoaded)`, so with a missing/invalid Maps API key (e.g. on Vercel) the SDK never loaded, coords were captured but never propagated to state → `latitude`/`longitude` saved as `null`. Fixed: coordinates now propagate unconditionally (reverse-geocoded address is best-effort on top); geolocation timeout raised 5s→15s.
 - **`TITLE_ROUTES` was a swallowed `ReferenceError` (fixed for free by the ML split)** — the Others keyword-fallback path used `TITLE_ROUTES` in the old `backend/routes/complaints.js`, but that constant was defined-and-unexported in `pipeline.js` and never imported into the route → it threw a `ReferenceError` that the fail-open catch silently absorbed (keyword advisory never actually ran). The orchestration now lives in `ml-service/infer.js`, which **imports `TITLE_ROUTES` from `./ml/pipeline`** (pipeline.js now exports it) → the keyword fallback works.
+- **Client-side image compression added (July 2026)** — `complaintRegister.tsx` now compresses photos to 800×800 JPEG 70% quality via canvas before sending. Previously raw phone photos (3-12MP, 3-5MB) were sent as-is, causing larger payloads and slower ML decode. Fallback to raw `readAsDataURL` if canvas fails.
+- **ML block messages shown in citizen UI (July 2026)** — `citizen.saga.ts` now extracts both `message` and `suggestion` from 422 responses and concatenates them for the error display. `complaintRegister.tsx` renders a structured `<Alert>` with "Image Validation Failed" header + full explanation. Citizens see exactly why their image was rejected and what to do (e.g., "The image appears to show a 'potholes' issue instead — consider re-categorizing").
+
+### Search & filter (July 2026)
+- **Client-side search + status filter** added to both `adminHome.tsx` and `userHome.tsx`. Status chips (Active/Pending/Progress/Completed) are now **clickable toggles** — click to filter, click again to clear. A search bar supports text search across complaint ID (`CMP-XXXX`), title, description, category type, and citizen name (both views). Both filters compose (status + search). A "Clear filters" chip and result count appear when filters are active. Empty-state message shown when no complaints match. All filtering is client-side via `useMemo` (no backend changes needed — complaints are already loaded in full). The `ComplaintMap` on admin view updates to show only filtered complaints.
+
+### Citizen-scoped complaints + auto-sync (July 2026)
+- **Citizen dashboard now shows only own complaints** — `getUserHome()` passes `?citizenPhone=<phone>` to the backend; `GET /api/complaints` supports `citizenPhone` query param for server-side filtering. Admin/superadmin views still see all complaints.
+- **CMP-XXXX ID + citizen name displayed on cards** — both citizen and admin complaint cards now show the complaint reference ID (e.g. `CMP-2401`) and, on admin cards, the citizen who filed it. The `complaintDetails` dialog also shows the complaint ID, citizen name/phone, registration date, and forwarded department.
+- **15-second auto-sync** — citizen, admin, and superadmin dashboards silently poll for updated data every 15 seconds without showing a loading spinner (loading indicator only on initial load). Polling pauses when a detail/update dialog is open. Complaint detail views also auto-refresh every 15 seconds to reflect status updates and resolved images. Reducers were updated to distinguish initial load (shows spinner) from subsequent polls (silent update).
 
 ## Frontend UI/UX audit findings (July 2026)
 
@@ -301,7 +328,7 @@ In `ml-service/` (runtime, loaded by the inference service):
 - Color contrast concerns: `rgba(255,255,255,0.85)` and `rgba(26,36,56,0.7)` may fail WCAG AA
 
 ### UX gaps (P1)
-- **No loading states** on form submission (double-submit risk on login, register, complaint creation)
+- ~~**No loading states** on form submission (double-submit risk on login, register, complaint creation)~~ **FIXED (July 2026)** — complaint registration now shows "Validating image…" with spinner during ML inference.
 - **No Error Boundary** — component crash = white screen
 - `alert()`/`confirm()` used in 7 places (`App.js:469,479,497,509,526,542`, `GoogleMap.jsx:311,351`) — Toast component exists at `Toast.jsx` but is never imported
 - No optimistic updates on status changes or deletions

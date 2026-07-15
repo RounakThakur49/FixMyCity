@@ -6,8 +6,8 @@ Built for **SIH PS 25031** (Smart India Hackathon — Civic Issue Reporting).
 
 FixMyCity is a **3-tier application**:
 
-- **Frontend** (`frontend/`) — React 19 (CRA) SPA, deployed to Vercel. Talks only to the backend.
-- **Backend** (`backend/`) — Express + MongoDB + JWT API. Lightweight (no ML deps); handles auth, CRUD, and proxies image validation to the ML service.
+- **Frontend** (`frontend/`) — React 19 + TypeScript + Vite 8 SPA, MUI 9 + Redux/Saga. Talks only to the backend via Vite dev proxy.
+- **Backend** (`backend/`) — Express + MongoDB + JWT API. Lightweight (no ML deps); handles auth, CRUD, and proxies image validation to the ML service. Supports three roles: **citizen**, **admin**, and **superadmin** (with email OTP 2FA for superadmin login).
 - **ML service** (`ml-service/`) — standalone Express inference service (EfficientNetV2S civic classifier + NSFW moderation + CLIP), deployed on an Oracle Cloud A1 VM (primary) or co-run inline on Render (fallback). Called server-to-server by the backend.
 
 ---
@@ -16,7 +16,7 @@ FixMyCity is a **3-tier application**:
 
 | Layer | Tech |
 |-------|------|
-| Frontend | React 19 (Create React App), framer-motion, lucide-react, Google Maps |
+| Frontend | React 19 + TypeScript, Vite 8, MUI 9, Redux + redux-saga, Leaflet (multi-pin maps) |
 | Backend | Node.js 20 LTS, Express 4, Mongoose, bcryptjs, jsonwebtoken, helmet, express-rate-limit — **no ML deps** |
 | Database | MongoDB (Atlas cluster or local) |
 | ML service | Node.js 20 LTS, Express 4 + `@tensorflow/tfjs` (pure-JS), `nsfwjs`, `@xenova/transformers` (CLIP) |
@@ -44,11 +44,25 @@ The image validation pipeline runs a **custom 4-class civic model** (EfficientNe
                          └────────────────┘
 ```
 
-- **Frontend → Backend** — all data + JWT auth. Base URL from `REACT_APP_API_URL` (baked at build time).
+- **Frontend → Backend** — all data + JWT auth. In production, Vercel rewrites `/api/*` to the Render backend (configured in `frontend/vercel.json`). In dev, Vite's proxy handles routing.
 - **Backend → ML service** — server-to-server (no CORS), guarded by a shared `X-ML-KEY` secret. **Fails open**: if the ML service is down/unreachable, the complaint still saves without image validation.
 - **Backend → MongoDB Atlas** — users, complaints, reviews.
 
 Each tier runs and deploys independently. See [`DEPLOY.md`](./DEPLOY.md) for the full runbook.
+
+---
+
+## Features
+
+- **Role-based dashboards** — citizen (own complaints only), admin (all complaints + status update), superadmin (analytics + user management + admin creation)
+- **Complaint ID tracking** — each complaint gets a sequential `CMP-XXXX` reference, displayed on cards and detail views
+- **Search & filter** — search by complaint ID, title, description, category, or citizen name; status filter chips (Pending / Progress / Completed) toggle on click
+- **Complaint details** — full timeline with progress stepper, citizen info (name/phone/registration date), forwarded department, map, and photo evidence
+- **15-second auto-sync** — all dashboards silently poll for updates without page reload; loading spinner only on initial load; pauses when dialogs are open
+- **AI image validation** — EfficientNetV2S civic classifier + NSFW moderation + CLIP (see ML pipeline section below). Block messages are shown in the citizen UI with actionable suggestions.
+- **Client-side image compression** — photos are compressed to 800×800 JPEG 70% quality before upload, reducing payload size and ML processing time
+- **JWT auth with 3 roles** — citizen, admin, superadmin (with email OTP 2FA for superadmin)
+- **Live GPS location** — complaint form captures device GPS coordinates and reverse-geocodes the address
 
 ---
 
@@ -147,25 +161,27 @@ In a **new terminal**:
 ```bash
 cd frontend
 npm install
-npm start
+npm run dev
 ```
 
-App opens at `http://localhost:3000`. The frontend reads the backend URL from `REACT_APP_API_URL` (see `frontend/.env.example`; defaults to `http://localhost:5000`).
+App opens at `http://localhost:5173`. The Vite dev server proxies `/api/*` to `http://localhost:5000` (configured in `vite.config.ts`).
 
 ### 6. Log in
 
 Default users are seeded on first connect (only if the DB is empty), defined in
-`backend/db/seed.js`. The seeded **citizen** demo login is:
+`backend/db/seed.js`.
 
-| Role | Username | Password |
-|------|----------|----------|
-| Citizen | `9876543210` | `citizen123` |
+| Role | Identifier | Password |
+|------|-----------|----------|
+| Citizen | Phone number (from seed) | Set in `seed.js` |
+| Admin | Email (from seed) | Set in `seed.js` |
+| Super Admin | `SUPERADMIN_EMAIL` env var | `SUPERADMIN_PASSWORD` env var |
 
-The admin account is also seeded there. **Change the seeded admin credentials in
-`backend/db/seed.js` before any public deployment** — do not ship the demo admin
-password. Passwords are bcrypt-hashed; each user needs a distinct Aadhaar.
+Super admin login requires email OTP verification (2FA) via **Brevo SMTP**. Set `BREVO_SMTP_USER` + `BREVO_API_KEY` in `backend/.env`. In dev without Brevo creds, OTP prints to server console.
 
-> **Auth (July 2026):** login/register return a signed **JWT**. The frontend stores it in the `session` object and sends `Authorization: Bearer <token>` on all writes. Reads (`GET`) stay public. Server-side middleware enforces roles — a citizen token cannot hit admin routes (status/delete). A 401 on any write forces a clean re-login.
+**Change the seeded credentials in `backend/db/seed.js` before any public deployment** — do not ship demo passwords. Passwords are bcrypt-hashed; each user needs a distinct Aadhaar.
+
+> **Auth:** login/register return a signed **JWT**. The frontend stores it in sessionStorage and sends `Authorization: Bearer <token>` on all writes. Reads (`GET`) stay public. Server-side middleware enforces roles — a citizen token cannot hit admin routes. A 401 on any write forces a clean re-login.
 
 ---
 
@@ -182,12 +198,11 @@ curl http://localhost:7860/health        # ML service directly
 
 Each tier has its own `.env.example` — copy it to `.env` for local dev, or set the values in your host's dashboard for deployment.
 
-**Frontend** (`frontend/.env.example`):
+**Frontend** — uses relative `/api/*` paths. In production, the hosting platform (Vercel) proxies these to the backend via `vercel.json` rewrites. No env vars needed for the API URL.
 
 | Var | Purpose |
 |-----|---------|
-| `REACT_APP_API_URL` | Base URL of the backend API. **Baked at build time** — redeploy after changing. Defaults to `http://localhost:5000`. |
-| `REACT_APP_GOOGLE_MAPS_API_KEY` | (Optional) Google Maps key; without it the map falls back to geolocation-only. |
+| (none required) | API routing handled by Vite dev proxy (local) or `vercel.json` rewrites (production) |
 
 **Backend** (`backend/.env.example`):
 
@@ -282,21 +297,31 @@ FixMyCity/
 │   ├── deploy-oracle.sh            # Oracle A1 one-shot split setup (Node 20 + pm2)
 │   ├── .env.example                # PORT=7860, ML_KEY
 │   └── README.md                   # ML service docs
-├── frontend/
-│   ├── .env.example                # REACT_APP_API_URL, Google Maps key
+├── frontend/                       # React 19 + TypeScript + Vite SPA
+│   ├── .env.example                # VITE_API_URL
+│   ├── vite.config.ts              # Vite config with /api proxy to :5000
+│   ├── tsconfig.json               # TypeScript config
 │   ├── src/
-│   │   ├── App.js                  # Single source of truth — all state + handlers
-│   │   ├── aadhaar.js              # Verhoeff validation (mirror of backend)
-│   │   ├── App.css                 # Styles
-│   │   └── components/
-│   │       ├── Hero.jsx            # Landing page + auth forms
-│   │       ├── CitizenDashboard.jsx
-│   │       ├── AdminDashboard.jsx
-│   │       ├── ComplaintForm.jsx
-│   │       ├── ComplaintDetail.jsx
-│   │       ├── GoogleMap.jsx
-│   │       ├── Header.jsx
-│   │       └── Timeline.jsx
+│   │   ├── App.tsx                 # Role-based view state machine (citizen|admin|superadmin)
+│   │   ├── main.tsx                # Root render + MUI theme
+│   │   ├── apis/                   # API constants, axios client, functions
+│   │   ├── actions/                # Redux action slices (auth, citizen, admin)
+│   │   ├── reducers/               # Redux reducers
+│   │   ├── sagas/                  # Redux-saga workers (auth, citizen, admin)
+│   │   ├── store/                  # Redux store config
+│   │   └── components/layout/
+│   │       ├── TabGroup.tsx         # Login/Register tabs (unauthenticated)
+│   │       ├── Login.tsx            # Login form (citizen/admin/superadmin + OTP)
+│   │       ├── Registration.tsx     # Citizen registration form
+│   │       ├── userHome.tsx         # Citizen dashboard (complaints + status tracker)
+│   │       ├── adminHome.tsx        # Admin dashboard (all complaints + map + status update)
+│   │       ├── useage.tsx           # Superadmin analytics + user management + create admin
+│   │       ├── complaintRegister.tsx # New complaint form (GPS location + photo)
+│   │       ├── complaintDetails.tsx  # Complaint detail dialog + timeline + status stepper
+│   │       ├── complaintMap.tsx      # Map component (single/multi-pin, Google Maps + Leaflet)
+│   │       ├── updateStatus.tsx      # Admin status update form
+│   │       ├── Profile.tsx           # Edit profile dialog
+│   │       └── ResponsiveAppBar.tsx  # Top navigation bar
 │   └── public/
 ├── tests/e2e/                      # Playwright suite
 ├── render.yaml                     # Render blueprint (fallback deploy, repo root)
@@ -439,6 +464,14 @@ node server.js
 | GET | `/api/reviews` | List reviews | public |
 | POST | `/api/reviews` | Submit review | **auth** |
 | PATCH | `/api/auth/update-profile` | Update own profile (identity from token) | **auth** |
+| POST | `/api/auth/verify-otp` | Verify superadmin OTP (uses pending JWT) | public |
+| GET | `/api/superadmin/stats` | Complaint analytics dashboard | **superadmin** |
+| GET | `/api/superadmin/admins` | List all regular admins | **superadmin** |
+| POST | `/api/superadmin/admins` | Create a new admin account | **superadmin** |
+| DELETE | `/api/superadmin/admins/:id` | Delete an admin | **superadmin** |
+| GET | `/api/superadmin/admins/:id/activity` | Admin status-update activity log | **superadmin** |
+| GET | `/api/superadmin/citizens` | List all citizens (paginated) | **superadmin** |
+| GET | `/api/superadmin/citizens/:id/activity` | Citizen complaint activity log | **superadmin** |
 
 ### Security
 
@@ -460,7 +493,7 @@ node server.js
 
 Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 
-- **Shipped (July 2026):** JWT auth + role middleware, Aadhaar Verhoeff validation, edit-profile fix, live-GPS fix, backend **pagination** (`?page&limit&status`, back-compat), Timeline animation fix, **modular backend** (`server.js` 1610→115 lines; concerns split into `config/ db/ middleware/ ml/ routes/ utils/`).
+- **Shipped (July 2026):** JWT auth + role middleware, Aadhaar Verhoeff validation, edit-profile fix, live-GPS fix, backend **pagination** (`?page&limit&status`, back-compat), Timeline animation fix, **modular backend** (`server.js` 1610→115 lines; concerns split into `config/ db/ middleware/ ml/ routes/ utils/`), **search + status filter** on admin and citizen dashboards (clickable status chips + text search by ID/title/description/category).
 - **Next (coordinated FE+BE):** wire the frontend to consume pagination; offload base64 images from MongoDB to **GridFS/S3** with a serving route + one-time migration (must ship with a frontend deploy — base64 rendering changes to URLs).
 - **Then:** `React.memo`/`useCallback` pass, CSS consolidation (3 design systems → 1 token set), keyboard a11y + focus traps (WCAG AA), replace `alert()/confirm()` with the `Toast` component, `controllers/` layer, request-validation middleware, Aadhaar encryption at rest.
 
@@ -473,7 +506,7 @@ Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 | `npm install` fails on `@tensorflow/tfjs-node` | This project uses pure-JS tfjs. Run `npm uninstall @tensorflow/tfjs-node` |
 | `MongoServerError: bad auth` | Wrong MONGO_URI user/password. URL-encode special characters. |
 | `MongooseError: Could not connect` | Atlas Network Access doesn't include your IP. Add `0.0.0.0/0` for dev. |
-| Frontend shows "Could not connect to server" | Backend not running or wrong port. Check `http://localhost:5000/api/health`. Also verify `REACT_APP_API_URL`. |
+| Frontend shows "Could not connect to server" | Backend not running or wrong port. Check `http://localhost:5000/api/health`. In production, verify `vercel.json` rewrites point to the correct Render URL. |
 | Node 24 errors | Use Node 20 LTS. TFJS native prebuilts don't exist for NAPI v10. |
 | `[civic] civic_model_tfjs/model.json not found` (ML service) | Train the model first (`python train_civic_model.py`) and copy `civic_model_tfjs/` into `ml-service/`. |
 | Complaints save but images never blocked | ML service down/unreachable, or `ML_SERVICE_URL` unset — backend fails open. Start `ml-service` and set `ML_SERVICE_URL`. |
@@ -488,7 +521,7 @@ Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 Build the frontend:
 
 ```bash
-cd frontend && npm run build    # output in frontend/build/
+cd frontend && npm run build    # output in frontend/dist/
 ```
 
 For a hosted deployment (Vercel + Render + Hugging Face Spaces), follow **[`DEPLOY.md`](./DEPLOY.md)**. For a self-managed setup, keep `backend` (`npm start`) and `ml-service` (`node server.js`) alive with `pm2` or `systemd`.

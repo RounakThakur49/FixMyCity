@@ -1,0 +1,363 @@
+/* ── Design System – Hero CSS Variables (from ReactProject2) ─────── */
+:root {
+  --bg-gradient: linear-gradient(135deg, #f4f8f6 0%, #ebf2ef 50%, #e1e9e5 100%);
+  --panel-glass: rgba(255, 255, 255, 0.72);
+  --panel-glass-solid: rgba(255, 255, 255, 0.94);
+  --panel-border: rgba(255, 255, 255, 0.6);
+  --text-main: #0c1816;
+  --text-muted: #52635f;
+  --line-color: rgba(12, 24, 22, 0.07);
+
+  --brand: #0f766e;
+  --brand-hover: #0b5250;
+  --brand-light: #14b8a6;
+  --brand-soft: #f0fdfa;
+
+  --blue: #2563eb;
+  --blue-soft: #eff6ff;
+
+  --warning: #d97706;
+  --warning-soft: #fef3c7;
+
+  --success: #059669;
+  --success-soft: #ecfdf5;
+
+  --danger: #dc2626;
+  --danger-soft: #fef2f2;
+
+  --shadow-card: 0 16px 36px rgba(15, 30, 28, 0.05), 0 4px 12px rgba(15, 30, 28, 0.02);
+  --shadow-hover: 0 24px 50px rgba(15, 30, 28, 0.12), 0 6px 16px rgba(15, 30, 28, 0.04);
+  --shadow-lg: 0 32px 64px rgba(15, 30, 28, 0.1), 0 8px 24px rgba(15, 30, 28, 0.06);
+
+  --radius-inner: 0.8rem;
+  --radius-card: 1.5rem;
+  --radius-full: 9999px;
+
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ── Registration Page Shell ────────────────────────────────────── */
+.registration-shell {
+  min-height: 100vh;
+  /* Civic skyline (urban living) under a teal→blue brand wash: keeps the city
+     concept legible and bright while tinting it to the FixMyCity palette so the
+     white auth card stays high-contrast on top. */
+  background-color: #0f766e;
+  background-image:
+    linear-gradient(135deg, rgba(15, 118, 110, 0.82) 0%, rgba(13, 60, 78, 0.78) 55%, rgba(30, 58, 138, 0.80) 100%),
+    url('../../assets/background1.jpg');
+  background-size: cover, cover;
+  background-position: center, center;
+  background-repeat: no-repeat, no-repeat;
+  background-attachment: fixed, fixed;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  font-family: 'Plus Jakarta Sans', 'Inter', system-ui, sans-serif;
+}
+
+/* Glow bloom top + soft vignette bottom for depth behind the card. */
+.registration-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(1100px 560px at 50% -12%, rgba(20, 184, 166, 0.35), transparent 60%),
+    radial-gradient(900px 480px at 50% 120%, rgba(6, 24, 32, 0.45), transparent 58%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Keep the auth card above the background layers. */
+.reg-hero-panel {
+  position: relative;
+  z-index: 1;
+}
+
+
+
+/* ── Hero Panel (Auth Card Frame) ───────────────────────────────── */
+.reg-hero-panel {
+  background: var(--panel-glass-solid);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-card);
+  padding: 2.2rem 2rem;
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  width: 100%;
+  max-width: 620px;
+}
+
+/* ── Eyebrow Tag ─────────────────────────────────────────────────── */
+.eyebrow-modern {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--brand);
+  background: rgba(20, 184, 166, 0.1);
+  padding: 0.35rem 0.85rem;
+  border-radius: var(--radius-full);
+  margin-bottom: 1rem;
+}
+
+/* ── Form Title Group ────────────────────────────────────────────── */
+.form-title-group {
+  margin-bottom: 1.5rem;
+  text-align: center;
+}
+
+.form-title-group h2 {
+  font-size: 1.6rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--text-main);
+  margin-bottom: 0.3rem;
+}
+
+.form-title-group p {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* ── Auth Form ───────────────────────────────────────────────────── */
+.auth-form-modern {
+  display: flex;
+  flex-direction: column;
+  gap: 1.15rem;
+}
+
+/* ── 2-Column Grid for form rows ─────────────────────────────────── */
+.form-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+.form-full-col {
+  grid-column: 1 / -1;
+}
+
+/* ── Input Group ─────────────────────────────────────────────────── */
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  width: 100%;
+}
+
+.input-group label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+/* ── Input Wrapper (icon + field) ───────────────────────────────── */
+.input-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.input-icon {
+  position: absolute;
+  left: 0.95rem;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* ── Base Input / Select / Textarea ─────────────────────────────── */
+.reg-hero-panel input:not([class*="Mui"]),
+.reg-hero-panel select,
+.reg-hero-panel textarea {
+  width: 100%;
+  padding: 0.8rem 1.1rem;
+  border-radius: var(--radius-inner);
+  border: 1px solid var(--line-color);
+  background: rgba(255, 255, 255, 0.8);
+  font-size: 0.9rem;
+  color: var(--text-main);
+  font-family: inherit;
+  transition: all 0.2s var(--ease-out);
+  box-sizing: border-box;
+}
+
+.reg-hero-panel input:not([class*="Mui"]):hover,
+.reg-hero-panel select:hover,
+.reg-hero-panel textarea:hover {
+  border-color: rgba(15, 118, 110, 0.25);
+  background: #ffffff;
+}
+
+.reg-hero-panel input:not([class*="Mui"]):focus,
+.reg-hero-panel select:focus,
+.reg-hero-panel textarea:focus {
+  outline: none;
+  border-color: var(--brand-light);
+  background: #ffffff;
+  box-shadow: 0 0 0 4px rgba(20, 184, 166, 0.12);
+}
+
+.reg-hero-panel textarea {
+  resize: vertical;
+  padding-left: 1.1rem;
+}
+
+.reg-hero-panel .input-wrapper input,
+.reg-hero-panel .input-wrapper select {
+  padding-left: 2.8rem;
+}
+
+/* ── MUI Autocomplete / TextField Customization ────────────────── */
+.reg-hero-panel .MuiAutocomplete-root .MuiOutlinedInput-root {
+  border-radius: var(--radius-inner) !important;
+  font-size: 0.9rem !important;
+  background: rgba(255, 255, 255, 0.8) !important;
+  font-family: inherit !important;
+  transition: all 0.2s var(--ease-out) !important;
+  padding: 0.25rem 0.5rem !important;
+}
+
+.reg-hero-panel .MuiAutocomplete-root .MuiOutlinedInput-root .MuiOutlinedInput-notchedOutline {
+  border-color: var(--line-color) !important;
+}
+
+.reg-hero-panel .MuiAutocomplete-root .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline {
+  border-color: rgba(15, 118, 110, 0.25) !important;
+}
+
+.reg-hero-panel .MuiAutocomplete-root .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: var(--brand-light) !important;
+  border-width: 1px !important;
+}
+
+.reg-hero-panel .MuiAutocomplete-root .MuiOutlinedInput-root.Mui-focused {
+  background: #ffffff !important;
+  box-shadow: 0 0 0 4px rgba(20, 184, 166, 0.12) !important;
+}
+
+.reg-hero-panel .MuiAutocomplete-root .MuiInputLabel-root {
+  font-family: inherit !important;
+  font-size: 0.9rem !important;
+  color: var(--text-muted) !important;
+}
+
+.reg-hero-panel .MuiAutocomplete-root .MuiInputLabel-root.Mui-focused {
+  color: var(--brand) !important;
+}
+
+
+/* ── Primary Button ──────────────────────────────────────────────── */
+.primary-btn {
+  background: linear-gradient(135deg, var(--brand), var(--brand-hover));
+  color: #ffffff;
+  border: none;
+  font-weight: 700;
+  cursor: pointer;
+  border-radius: var(--radius-inner);
+  padding: 0.85rem 1.5rem;
+  font-size: 0.9rem;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 16px rgba(15, 118, 110, 0.18);
+  transition: all 0.25s var(--ease-out);
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+.primary-btn:hover {
+  box-shadow: 0 10px 24px rgba(15, 118, 110, 0.28);
+  transform: translateY(-1px);
+}
+
+.primary-btn:active {
+  transform: translateY(0);
+  box-shadow: 0 4px 10px rgba(15, 118, 110, 0.18);
+}
+
+/* ── Ghost / Link-style button ───────────────────────────────────── */
+.ghost-btn {
+  background: transparent;
+  border: none;
+  color: var(--brand);
+  font-weight: 700;
+  font-size: 0.85rem;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius-inner);
+  transition: all 0.2s;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ghost-btn:hover {
+  color: var(--brand-hover);
+  background: rgba(15, 118, 110, 0.05);
+  text-decoration: none;
+}
+
+/* ── Footer Note (already have an account) ───────────────────────── */
+.reg-footer-note {
+  margin-top: 1.25rem;
+  text-align: center;
+  font-size: 0.83rem;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+/* ── Disabled input state (city before state is chosen) ─────────── */
+.reg-hero-panel input:disabled,
+.reg-hero-panel select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: rgba(0, 0, 0, 0.03);
+}
+
+/* ── Mode Toggle Pill (User Type Selector) ─────────────────────── */
+.mode-toggle-pill {
+  display: inline-flex;
+  background: rgba(12, 24, 22, 0.05);
+  padding: 0.25rem;
+  border-radius: var(--radius-full);
+}
+
+.mode-btn {
+  border: none;
+  background: transparent;
+  padding: 0.45rem 1.2rem;
+  border-radius: var(--radius-full);
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.mode-btn.is-active {
+  background: var(--brand);
+  color: #ffffff;
+}
+
+/* ── Responsive ──────────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  .form-two-col {
+    grid-template-columns: 1fr;
+  }
+
+  .reg-hero-panel {
+    padding: 1.5rem 1.25rem;
+  }
+}

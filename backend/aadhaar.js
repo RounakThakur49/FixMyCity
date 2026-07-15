@@ -57,6 +57,14 @@ function verhoeffValid(numStr) {
 
 /**
  * Validate an Aadhaar number.
+ *
+ * DEMO MODE (current): only checks format (12 digits, first digit 2-9).
+ * Verhoeff checksum is SKIPPED so any 12-digit demo number works.
+ *
+ * TODO (production): re-enable Verhoeff checksum by uncommenting the block
+ * below, or integrate UIDAI's OTP-consented AUA/KUA API for real identity
+ * verification.
+ *
  * @param {*} value - candidate (only strings can be valid).
  * @returns {{valid: boolean, message: string}}
  */
@@ -71,9 +79,10 @@ function validateAadhaar(value) {
   if (aadhar[0] === '0' || aadhar[0] === '1') {
     return { valid: false, message: 'Invalid Aadhar number — cannot start with 0 or 1.' };
   }
-  if (!verhoeffValid(aadhar)) {
-    return { valid: false, message: 'Invalid Aadhar number — checksum failed. Please re-check the number.' };
-  }
+  // Verhoeff checksum — disabled for demo. Uncomment for production:
+  // if (!verhoeffValid(aadhar)) {
+  //   return { valid: false, message: 'Invalid Aadhar number — checksum failed. Please re-check the number.' };
+  // }
   return { valid: true, message: '' };
 }
 
