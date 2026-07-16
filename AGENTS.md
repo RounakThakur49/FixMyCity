@@ -19,7 +19,7 @@ Frontend (run from `frontend/`):
 cd frontend
 npm install
 npm run dev              # Vite dev server on :5173 (proxies /api/* → :5000)
-npm run build            # TypeScript compile + Vite production build to /dist
+npm run build            # TypeScript compile + Vite production build to /build
 npm run preview          # Preview the production build locally
 ```
 

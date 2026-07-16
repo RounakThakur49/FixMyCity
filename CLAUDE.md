@@ -19,7 +19,7 @@ Frontend (run from `frontend/`):
 cd frontend
 npm install
 npm run dev               # Vite dev server on :5173
-npm run build             # production build to /dist
+npm run build             # production build to /build
 npx tsc --noEmit          # type-check (no emit)
 ```
 

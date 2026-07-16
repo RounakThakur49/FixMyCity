@@ -521,7 +521,7 @@ Prioritized in CLAUDE.md → "Future work roadmap". Highlights:
 Build the frontend:
 
 ```bash
-cd frontend && npm run build    # output in frontend/dist/
+cd frontend && npm run build    # output in frontend/build/
 ```
 
 For a hosted deployment (Vercel + Render + Hugging Face Spaces), follow **[`DEPLOY.md`](./DEPLOY.md)**. For a self-managed setup, keep `backend` (`npm start`) and `ml-service` (`node server.js`) alive with `pm2` or `systemd`.
