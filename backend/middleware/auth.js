@@ -36,11 +36,21 @@ function requireAuth(req, res, next) {
 
 function requireAdmin(req, res, next) {
   requireAuth(req, res, () => {
-    if (req.auth.role !== 'admin') {
+    // Super admin is a strict superset of admin — it passes every admin-gated route.
+    if (req.auth.role !== 'admin' && req.auth.role !== 'superadmin') {
       return res.status(403).json({ message: 'Admin privileges required.' });
     }
     return next();
   });
 }
 
-module.exports = { issueToken, extractToken, requireAuth, requireAdmin, JWT_SECRET };
+function requireSuperAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (req.auth.role !== 'superadmin') {
+      return res.status(403).json({ message: 'Super admin privileges required.' });
+    }
+    return next();
+  });
+}
+
+module.exports = { issueToken, extractToken, requireAuth, requireAdmin, requireSuperAdmin, JWT_SECRET };

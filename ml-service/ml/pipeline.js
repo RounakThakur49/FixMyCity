@@ -1,0 +1,881 @@
+// =============================================================================
+// ML PIPELINE — NSFW pre-screen + custom 4-class civic classifier + OOD + CLIP
+// -----------------------------------------------------------------------------
+// Extracted verbatim from the former monolithic server.js (July 2026 modular
+// refactor). All live model state (civicModel, ADVISORY_MODE, thresholds, …)
+// lives at module scope; routes call the exported functions/getters so they
+// always read current state. Model files load from the backend/ dir — since this
+// file now lives in backend/ml/, dirname is remapped to ROOT_DIR (= backend/).
+// =============================================================================
+const path = require('path');
+const fs = require('fs');
+const tf = require('@tensorflow/tfjs');
+const nsfwjs = require('nsfwjs');
+const jpeg = require('jpeg-js');
+const { PNG } = require('pngjs');
+const othersClip = require('../others_clip');
+
+// Model artefacts live in backend/, one level up from this module. Remap so the
+// sliced body's path.join(<dir>, ...) calls resolve exactly as in server.js.
+const ROOT_DIR = path.join(__dirname, '..');
+
+// =============================================================================
+// CONTENT MODERATION — nsfwjs adult/explicit content pre-screen
+// =============================================================================
+
+let nsfwModel = null;
+
+// NSFW categories returned by nsfwjs and their block thresholds
+const NSFW_RULES = [
+  { category: 'Porn',    threshold: 0.40 }, // explicit content
+  { category: 'Hentai',  threshold: 0.40 }, // animated adult content
+  { category: 'Sexy',    threshold: 0.70 }, // suggestive (higher bar)
+];
+
+async function loadNsfwModel() {
+  try {
+    console.log('[nsfw] Loading nsfwjs content moderation model...');
+    // nsfwjs loads its own model from the bundled path (no CDN needed after npm install)
+    nsfwModel = await nsfwjs.load();
+    console.log('[nsfw] Content moderation model ready.');
+  } catch (e) {
+    console.error('[nsfw] Failed to load nsfwjs model:', e.message);
+    console.warn('[nsfw] Adult content filtering DISABLED — submissions not pre-screened.');
+    nsfwModel = null;
+  }
+}
+
+// checkNSFW(base64Str, sharedTensor?)
+//   sharedTensor — an OPTIONAL pre-decoded [H,W,3] tensor (from decodeImageToTensor).
+//   When supplied, we reuse it instead of decoding the JPEG/PNG again — the civic
+//   path decodes the SAME image microseconds later, so infer() decodes once and
+//   hands the tensor to both. Ownership stays with the CALLER: we never dispose a
+//   shared tensor here (only the uint8 copy we make from it). When omitted we
+//   decode-and-dispose locally, exactly as before (back-compat for any direct call).
+async function checkNSFW(base64Str, sharedTensor = null) {
+  if (!nsfwModel) return null;
+  const ownTensor = !sharedTensor;
+  let rawTensor = sharedTensor;
+  let uint8 = null;
+  try {
+    if (!rawTensor) rawTensor = decodeImageToTensor(base64Str);
+    // nsfwjs expects a [H, W, 3] uint8 tensor
+    uint8 = tf.tidy(() => rawTensor.toInt().clipByValue(0, 255));
+    const predictions = await nsfwModel.classify(uint8);
+    // Convert array to map: { Porn: 0.02, Hentai: 0.01, Neutral: 0.95, Sexy: 0.01, Drawing: 0.01 }
+    const scores = {};
+    predictions.forEach(p => { scores[p.className] = parseFloat(p.probability.toFixed(4)); });
+
+    // Check each blocking rule
+    for (const rule of NSFW_RULES) {
+      const score = scores[rule.category] || 0;
+      if (score >= rule.threshold) {
+        return {
+          blocked: true,
+          category: rule.category,
+          score,
+          allScores: scores,
+          message: `Your image was flagged as potentially inappropriate (${rule.category}: ${(score * 100).toFixed(0)}%). Only photos of actual civic issues are allowed.`,
+        };
+      }
+    }
+    return { blocked: false, allScores: scores };
+  } catch (e) {
+    console.error('[nsfw] Inference error:', e.message);
+    return null; // fail open — never block due to NSFW model error
+  } finally {
+    // Dispose the uint8 copy always; dispose the raw tensor ONLY if we made it
+    // (a shared tensor is owned + disposed by the caller).
+    if (uint8) tf.dispose(uint8);
+    if (ownTensor && rawTensor) tf.dispose(rawTensor);
+  }
+}
+
+// =============================================================================
+// CIVIC IMAGE CLASSIFIER — Custom 4-class TFJS model (trained on civic data)
+// =============================================================================
+
+const CIVIC_CLASSES = ['drainage', 'others', 'potholes', 'streetlight'];
+
+// Maps the frontend complaint category string → our 4 model class names
+const CATEGORY_TO_CLASS = {
+  'Drainage problem':           'drainage',
+  'Potholes':                   'potholes',
+  'Broken street light problem':'streetlight',
+  'Others':                     'others',
+};
+
+// Reverse map: model class to human-facing category label (for advisory suggestions)
+const CLASS_TO_CATEGORY = {
+  drainage:    'Drainage problem',
+  potholes:    'Potholes',
+  streetlight: 'Broken street light problem',
+  others:      'Others',
+};
+
+// Per-class minimum confidence thresholds.
+// Loaded from civic_thresholds.json (generated by temperature_scaling.py).
+// These safe defaults are used when the JSON file doesn't exist yet.
+const DEFAULT_THRESHOLDS = {
+  drainage:    0.40,
+  others:      0.30,   // catch-all — most lenient
+  potholes:    0.45,
+  streetlight: 0.40,
+};
+
+let CLASS_THRESHOLDS = { ...DEFAULT_THRESHOLDS };
+let civicModel = null;
+
+// Per-class reliability flags from civic_thresholds.json ("reliable" block).
+// When reliable[class] === false, that class is NOT trustworthy enough to
+// reject a citizen — decideBlock degrades to advisory for that class.
+let RELIABLE = {};
+
+// Advisory mode: when true the server NEVER hard-blocks (only annotates).
+// Tripped by a sub-floor macro-F1, a calibration_warning, or a failed
+// load-time fixture self-test (preprocessing/model skew tripwire).
+let ADVISORY_MODE = false;
+
+// True once the loaded model exposes a raw-logits head (dual-output), which
+// unlocks energy-based OOD and correct temperature scaling.
+let HAS_LOGITS = false;
+
+// Backbone string for /api/health (overridden from thresholds JSON if present).
+let MODEL_BACKBONE = 'EfficientNetV2S';
+
+// Open-set / OOD detection config. Loaded from civic_thresholds.json ("ood" block).
+// Conservative defaults: entropy-only fallback works on softmax-only (legacy) models;
+// energy is used automatically when the model exposes raw logits.
+const DEFAULT_OOD = {
+  method: 'entropy',        // 'energy' (preferred, needs logits) | 'entropy' (softmax fallback)
+  temperature: 1.0,
+  energy_threshold: null,   // E(x) above this => OOD (only meaningful with logits)
+  entropy_threshold: 1.20,  // nats; max entropy for 4 classes is ln(4)=1.386. 1.20 is conservative.
+};
+let OOD_CONFIG = { ...DEFAULT_OOD };
+
+// Relative-confidence margins for the category-mismatch rules in decideBlock().
+// The {potholes,drainage} pair is visually correlated (road/asphalt), so it needs
+// a tighter margin than the global one to stop potholes passing as drainage.
+const RULE2_MARGIN = 0.12;               // RULE 2 global relative margin (was 0.20)
+const RULE2_MARGIN_ROAD = 0.05;          // RULE 2 margin for the potholes<->drainage pair
+const ROAD_PAIR = new Set(['potholes', 'drainage']);
+
+// Macro-F1 floor (matches spec ADVISORY_MACRO_F1). Below this the model is not
+// trustworthy enough to reject submissions; the server boots in advisory mode.
+const ADVISORY_MACRO_F1 = 0.55;
+
+// ---------------------------------------------------------------------------
+// Keyword title routes for the open-set "Others" category.
+// IMPORTANT: these are ONLY a cheap fallback advisory used when CLIP
+// (others_clip.js) is unavailable. They produce advisory suggestion text only;
+// they NEVER set openSet=false and NEVER trigger a block. CLIP is authoritative
+// when ready (§6.5).
+// ---------------------------------------------------------------------------
+const TITLE_ROUTES = [
+  {
+    targetType: 'Potholes',
+    keywords: [
+      'pothole', 'crater', 'road damage', 'road crack',
+      'road break', 'broken road', 'road hole', 'bad road',
+      'road pit', 'asphalt damage', 'tarmac damage', 'road surface',
+      'bumpy road', 'road dug up', 'road cavity', 'pit on road',
+      'depression road', 'road depression', 'road excavation hole',
+      'damaged road', 'road pothole', 'road rut',
+    ],
+  },
+  {
+    targetType: 'Drainage problem',
+    keywords: [
+      'drain', 'drainage', 'sewer', 'sewage', 'manhole', 'gutter',
+      'waterlog', 'waterlogged', 'overflow', 'water overflow',
+      'water clog', 'clogged drain', 'blockage', 'blocked drain',
+      'water stagnation', 'stagnant water', 'open drain', 'open manhole',
+      'uncovered manhole', 'water pipe burst', 'storm drain', 'nullah',
+      'canal overflow', 'choked drain', 'drain blocked', 'drain overflow',
+      'sewer burst', 'broken drain', 'drain cover missing', 'gutter blocked',
+      'storm water drain', 'rainwater drain blocked',
+    ],
+  },
+  {
+    targetType: 'Broken street light problem',
+    keywords: [
+      'streetlight', 'street light', 'lamppost', 'lamp post',
+      'electric pole', 'power pole', 'dark street', 'no light',
+      'broken light', 'light not working', 'light out', 'light off',
+      'broken lamp', 'lamp damaged', 'fused light', 'street dark',
+      'no electricity street', 'dangling wire', 'hanging wire',
+      'electric wire hanging', 'broken pole street', 'street lamp',
+      'traffic signal broken', 'signal light broken',
+    ],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Load civic_thresholds.json (calibrated per-class thresholds)
+// ---------------------------------------------------------------------------
+function loadThresholds() {
+  const thresholdsPath = path.join(ROOT_DIR, 'civic_thresholds.json');
+  try {
+    if (fs.existsSync(thresholdsPath)) {
+      const raw = JSON.parse(fs.readFileSync(thresholdsPath, 'utf8'));
+      // civic_thresholds.json may have structure { thresholds: {...} } or just { class: value }
+      const thresholds = raw.thresholds || raw;
+      CLASS_THRESHOLDS = { ...DEFAULT_THRESHOLDS, ...thresholds };
+      if (raw.ood && typeof raw.ood === 'object') {
+        OOD_CONFIG = { ...DEFAULT_OOD, ...raw.ood };
+      }
+      if (raw.reliable && typeof raw.reliable === 'object') {
+        RELIABLE = { ...raw.reliable };
+      }
+      if (raw.model_backbone) MODEL_BACKBONE = raw.model_backbone;
+
+      // Integrity gate: a sub-floor macro-F1 or any calibration warning means
+      // the model/calibration is not trustworthy — boot advisory (never block).
+      const macroF1 = typeof raw.val_macro_f1 === 'number' ? raw.val_macro_f1 : null;
+      if ((macroF1 != null && macroF1 < ADVISORY_MACRO_F1) || raw.calibration_warning) {
+        ADVISORY_MODE = true;
+        console.warn('==================================================================');
+        console.warn('[civic] ⚠️  ADVISORY MODE ENABLED — submissions will NOT be blocked.');
+        if (macroF1 != null && macroF1 < ADVISORY_MACRO_F1) {
+          console.warn(`        Reason: val_macro_f1=${macroF1.toFixed(3)} < ${ADVISORY_MACRO_F1} floor.`);
+        }
+        if (raw.calibration_warning) {
+          console.warn(`        Reason: calibration_warning="${raw.calibration_warning}"`);
+        }
+        console.warn('        Retrain/recalibrate (see RUNBOOK.md) to restore enforce mode.');
+        console.warn('==================================================================');
+      }
+      console.log('[civic] Loaded calibrated thresholds:', CLASS_THRESHOLDS);
+      console.log('[civic] OOD config:', OOD_CONFIG);
+      if (Object.keys(RELIABLE).length) console.log('[civic] Reliable flags:', RELIABLE);
+    } else {
+      console.warn('[civic] civic_thresholds.json not found — using safe defaults.');
+      console.warn('        Run: python temperature_scaling.py (after retraining)');
+    }
+  } catch (e) {
+    console.error('[civic] Failed to load thresholds, using defaults:', e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Custom filesystem IOHandler — reads model.json + .bin shards from disk
+// Works with @tensorflow/tfjs (browser build) in Node.js (no tfjs-node needed)
+// ---------------------------------------------------------------------------
+function makeFileSystemHandler(modelDir) {
+  return {
+    load: async () => {
+      const modelJsonPath = path.join(modelDir, 'model.json');
+      const modelJson = JSON.parse(fs.readFileSync(modelJsonPath, 'utf8'));
+
+      // Collect all weight shard paths from the manifest
+      const manifest = modelJson.weightsManifest || [];
+      const shardPaths = manifest.flatMap(m => m.paths || []);
+
+      // Concatenate all shard buffers into a single ArrayBuffer
+      const shardBuffers = shardPaths.map(p =>
+        fs.readFileSync(path.join(modelDir, p))
+      );
+      const totalBytes = shardBuffers.reduce((acc, b) => acc + b.length, 0);
+      const combined = Buffer.concat(shardBuffers, totalBytes);
+
+      const weightSpecs = manifest.flatMap(m => m.weights || []);
+
+      return {
+        modelTopology: modelJson.modelTopology,
+        weightSpecs,
+        weightData: combined.buffer.slice(
+          combined.byteOffset,
+          combined.byteOffset + combined.byteLength
+        ),
+        format: modelJson.format,
+        generatedBy: modelJson.generatedBy,
+        convertedBy: modelJson.convertedBy,
+        signature: modelJson.signature,
+        userDefinedMetadata: modelJson.userDefinedMetadata,
+      };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Load the custom TFJS 4-class civic model
+// ---------------------------------------------------------------------------
+async function loadCivicModelOnce() {
+  const modelDir = path.join(ROOT_DIR, 'civic_model_tfjs');
+  const modelJsonPath = path.join(modelDir, 'model.json');
+
+  if (!fs.existsSync(modelJsonPath)) {
+    console.error('[civic] civic_model_tfjs/model.json not found.');
+    console.error('        Run: python train_civic_model.py  — to train and export the model.');
+    console.warn('[civic] Image validation will be SKIPPED until model is available.');
+    return; // Missing artefact — NOT a backend fault, caller must not retry.
+  }
+
+  console.log('[civic] Loading custom 4-class civic model from civic_model_tfjs/...');
+  const ioHandler = makeFileSystemHandler(modelDir);
+  // Detect format: layers-model uses loadLayersModel, graph-model uses loadGraphModel
+  const modelJsonRaw = JSON.parse(fs.readFileSync(modelJsonPath, 'utf8'));
+  const isLayersModel = modelJsonRaw.format === 'layers-model';
+  if (isLayersModel) {
+    console.log('[civic] Detected layers-model format, using tf.loadLayersModel()');
+    civicModel = await tf.loadLayersModel(ioHandler);
+  } else {
+    console.log('[civic] Detected graph-model format, using tf.loadGraphModel()');
+    civicModel = await tf.loadGraphModel(ioHandler);
+  }
+  // Warm up with a dummy tensor. This is also where an unsupported-op fault on a
+  // given backend surfaces (predict throws) — the caller uses that to fall back.
+  const dummy = tf.zeros([1, 224, 224, 3]);
+  const warmup = await runCivicModel(dummy);
+  // Detect a dual-output (logits + probs) head: predict returns an array of
+  // 2+ tensors. This unlocks energy OOD + temperature scaling.
+  HAS_LOGITS = warmup.length >= 2;
+  warmup.forEach(t => t && t.dispose && t.dispose());
+  dummy.dispose();
+  console.log(`[civic] Civic ${isLayersModel ? 'layers' : 'graph'} model loaded (backend=${tf.getBackend()}). Classes:`, CIVIC_CLASSES);
+  console.log('[civic] Logits head present:', HAS_LOGITS);
+  console.log('[civic] Thresholds:', CLASS_THRESHOLDS);
+  await runFixtureSelfTest();
+}
+
+async function loadCivicModel() {
+  try {
+    await loadCivicModelOnce();
+  } catch (e) {
+    // If the failure happened on WASM (e.g. an op the wasm kernel doesn't
+    // implement, or numeric drift failing the fixture self-test), drop to the
+    // pure-JS cpu backend and reload ONCE. A slower-but-correct classifier beats
+    // a disabled one — disabled means the fail-open path accepts everything.
+    if (tf.getBackend() === 'wasm') {
+      console.warn('[civic] Model load/warmup failed on WASM — retrying on cpu backend:', e.message);
+      try {
+        await tf.setBackend('cpu');
+        await tf.ready();
+        ACTIVE_BACKEND = 'cpu';
+        civicModel = null;
+        await loadCivicModelOnce();
+        return;
+      } catch (e2) {
+        console.error('[civic] cpu fallback also failed:', e2.message);
+      }
+    } else {
+      console.error('[civic] Failed to load civic model:', e.message);
+    }
+    console.warn('[civic] Image validation will be SKIPPED until model is fixed.');
+    civicModel = null;
+  }
+}
+
+function normalizeModelOutput(output) {
+  if (!output) return [];
+  if (Array.isArray(output)) return output;
+  if (typeof output.data === 'function') return [output];
+  if (typeof output === 'object') {
+    const preferred = ['logits', 'probs', 'Identity', 'Identity_1', 'Identity:0', 'Identity_1:0']
+      .map(key => output[key])
+      .filter(t => t && typeof t.data === 'function');
+    const remaining = Object.entries(output)
+      .filter(([key, t]) => !['logits', 'probs', 'Identity', 'Identity_1', 'Identity:0', 'Identity_1:0'].includes(key) && t && typeof t.data === 'function')
+      .map(([, t]) => t);
+    return [...preferred, ...remaining];
+  }
+  return [];
+}
+
+async function runCivicModel(inputTensor) {
+  try {
+    const output = civicModel.predict(inputTensor);
+    return normalizeModelOutput(output && typeof output.then === 'function' ? await output : output);
+  } catch (e) {
+    if (civicModel && typeof civicModel.executeAsync === 'function') {
+      const output = await civicModel.executeAsync(inputTensor);
+      return normalizeModelOutput(output);
+    }
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Load-time self-test: if civic_thresholds.json declares expected_probs for a
+// committed civic_fixture.jpg, classify it and compare. A large drift means the
+// runtime preprocessing/model no longer matches what calibration saw — trip
+// ADVISORY_MODE so we never block citizens with a skewed model. Skips silently
+// when either the fixture or expected_probs is absent.
+// ---------------------------------------------------------------------------
+async function runFixtureSelfTest() {
+  try {
+    const thresholdsPath = path.join(ROOT_DIR, 'civic_thresholds.json');
+    if (!fs.existsSync(thresholdsPath)) return;
+    const raw = JSON.parse(fs.readFileSync(thresholdsPath, 'utf8'));
+    const expected = raw.expected_probs;
+    if (!expected || !Array.isArray(expected.probs)) return;
+
+    const fixtureName = expected.fixture || 'civic_fixture.jpg';
+    const fixturePath = path.join(ROOT_DIR, fixtureName);
+    if (!fs.existsSync(fixturePath)) return; // no fixture committed — skip silently
+
+    const b64 = `data:image/jpeg;base64,${fs.readFileSync(fixturePath).toString('base64')}`;
+    const result = await classifyCivicImage(b64);
+    if (!result || !result.classProbs) {
+      console.warn('[civic] Fixture self-test: classifier returned no result — skipping.');
+      return;
+    }
+    const got = CIVIC_CLASSES.map(c => result.classProbs[c] || 0);
+    let maxDiff = 0;
+    for (let i = 0; i < CIVIC_CLASSES.length; i++) {
+      maxDiff = Math.max(maxDiff, Math.abs(got[i] - (expected.probs[i] || 0)));
+    }
+    if (maxDiff > 0.05) {
+      ADVISORY_MODE = true;
+      console.error('==================================================================');
+      console.error(`[civic] ❌ FIXTURE SELF-TEST FAILED — max prob diff ${maxDiff.toFixed(3)} > 0.05.`);
+      console.error('        Runtime preprocessing/model does not match calibration.');
+      console.error(`        expected=[${expected.probs.join(', ')}] got=[${got.map(v => v.toFixed(3)).join(', ')}]`);
+      console.error('        ADVISORY MODE ENABLED — submissions will NOT be blocked.');
+      console.error('==================================================================');
+    } else {
+      console.log(`[civic] Fixture self-test passed (max prob diff ${maxDiff.toFixed(3)} <= 0.05).`);
+    }
+  } catch (e) {
+    console.warn('[civic] Fixture self-test error — skipping:', e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Image decoding — supports JPEG and PNG (via raw pixel extraction)
+// ---------------------------------------------------------------------------
+function decodeImageToTensor(base64Str) {
+  const base64Data = base64Str.replace(/^data:image\/\w+;base64,/, '');
+  const buffer = Buffer.from(base64Data, 'base64');
+
+  const isPng = buffer[0] === 0x89 && buffer[1] === 0x50;
+
+  let rawPixels, width, height;
+
+  if (isPng) {
+    try {
+      const png = PNG.sync.read(buffer);
+      width = png.width;
+      height = png.height;
+      const numPixels = width * height;
+      rawPixels = new Uint8Array(numPixels * 3);
+      for (let i = 0; i < numPixels; i++) {
+        rawPixels[i * 3]     = png.data[i * 4];
+        rawPixels[i * 3 + 1] = png.data[i * 4 + 1];
+        rawPixels[i * 3 + 2] = png.data[i * 4 + 2];
+      }
+    } catch {
+      throw new Error('Failed to decode PNG image. Please try uploading a JPEG image.');
+    }
+  } else {
+    // Cap decoded pixels to defuse a decompression bomb: a tiny JPEG can declare
+    // huge dimensions and balloon into gigabytes of RGBA on decode (DoS). jpeg-js
+    // enforces maxResolutionInMP; keep it modest since we downscale to 224x224
+    // anyway. Errors fail-open upstream (submission still saved, image unchecked).
+    const raw = jpeg.decode(buffer, { useTArray: true, maxResolutionInMP: 40, maxMemoryUsageInMB: 512 });
+    width = raw.width;
+    height = raw.height;
+    const numPixels = width * height;
+    rawPixels = new Uint8Array(numPixels * 3);
+    for (let i = 0; i < numPixels; i++) {
+      rawPixels[i * 3]     = raw.data[i * 4];
+      rawPixels[i * 3 + 1] = raw.data[i * 4 + 1];
+      rawPixels[i * 3 + 2] = raw.data[i * 4 + 2];
+    }
+  }
+
+  return tf.tensor3d(rawPixels, [height, width, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// EfficientNet preprocessing: [0, 255] → EfficientNet preprocess_input
+// IMPORTANT: EfficientNetB0/V2S uses its OWN internal preprocessing layer
+// baked in during Keras export.  The TFJS model therefore expects RAW
+// uint8 pixel values in [0, 255] — do NOT apply MobileNetV2-style /127.5-1
+// scaling here, as that would double-preprocess and badly degrade accuracy.
+//
+// EfficientNet's preprocess_input (Python) normalises to [-1, 1] internally
+// using (x / 127.5) - 1, but the Keras model already contains this as an
+// explicit Rescaling + Normalization layer so we must NOT repeat it.
+// ---------------------------------------------------------------------------
+function preprocessForCivicModel(imageTensor) {
+  return tf.tidy(() => {
+    // Resize to 224×224 — matching training image_size
+    const resized = tf.image.resizeBilinear(imageTensor, [224, 224]);
+    // Keep pixel values in [0, 255] as float32.
+    // The EfficientNet backbone's own preprocessing (baked into the TFJS model)
+    // will handle normalisation internally.
+    const floated = resized.toFloat();
+    return floated.expandDims(0); // [1, 224, 224, 3]  values in [0, 255]
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Run image through our civic model and get class probabilities.
+// Returns { classProbs, rawProbs, logits }:
+//   classProbs — calibrated softmax(logits / T) when logits + temperature are
+//                available, else the raw softmax head (thresholds enforce here).
+//   rawProbs   — uncalibrated softmax from the probs head (debug/advisory).
+//   logits     — raw logits object (or null for legacy softmax-only models).
+// When present, logits unlock the energy-based OOD score and temperature scaling.
+// ---------------------------------------------------------------------------
+async function classifyCivicImage(base64Str, sharedTensor = null) {
+  if (!civicModel) return null;
+
+  const ownTensor = !sharedTensor;
+  let rawTensor = sharedTensor;
+  let inputTensor = null;
+  let outTensors = [];
+
+  try {
+    if (!rawTensor) rawTensor = decodeImageToTensor(base64Str);
+    inputTensor = preprocessForCivicModel(rawTensor);
+    // A dual-output logits model returns [logits, probs]; a legacy model
+    // returns a single softmax tensor. Normalize both shapes.
+    outTensors = await runCivicModel(inputTensor);
+    if (!outTensors.length) throw new Error('Civic model returned no tensor outputs.');
+
+    let probsArr = null;
+    let logitsArr = null;
+
+    if (outTensors.length >= 2) {
+      // Two heads -- identify which is the softmax (values in [0,1] summing ~1).
+      const a = await outTensors[0].data();
+      const b = await outTensors[1].data();
+      const sum = (arr) => arr.reduce((s, v) => s + v, 0);
+      const aIsProb = Math.abs(sum(a) - 1) < 0.05 && Array.from(a).every(v => v >= 0 && v <= 1);
+      const bIsProb = Math.abs(sum(b) - 1) < 0.05 && Array.from(b).every(v => v >= 0 && v <= 1);
+      if (aIsProb && !bIsProb) { probsArr = a; logitsArr = b; }
+      else if (bIsProb && !aIsProb) { probsArr = b; logitsArr = a; }
+      else { probsArr = aIsProb ? a : b; logitsArr = aIsProb ? b : a; }
+    } else {
+      probsArr = await outTensors[0].data();
+      logitsArr = null;
+    }
+
+    // Raw (uncalibrated) softmax from the probs head.
+    const rawProbs = {};
+    CIVIC_CLASSES.forEach((cls, i) => {
+      rawProbs[cls] = parseFloat(probsArr[i].toFixed(4));
+    });
+
+    let logits = null;
+    if (logitsArr) {
+      logits = {};
+      CIVIC_CLASSES.forEach((cls, i) => {
+        logits[cls] = parseFloat(logitsArr[i].toFixed(4));
+      });
+    }
+
+    // Calibrated probs: when raw logits are available and a temperature is
+    // configured, recompute softmax(logits / T). Thresholds in decideBlock are
+    // then enforced on these calibrated probabilities (matching §3). Otherwise
+    // fall back to the raw softmax head.
+    let classProbs = rawProbs;
+    const T = OOD_CONFIG.temperature;
+    if (logitsArr && typeof T === 'number' && T > 0) {
+      const scaled = CIVIC_CLASSES.map((cls, i) => logitsArr[i] / T);
+      const maxV = Math.max(...scaled);
+      const exps = scaled.map(v => Math.exp(v - maxV));
+      const sumExp = exps.reduce((s, v) => s + v, 0) || 1;
+      classProbs = {};
+      CIVIC_CLASSES.forEach((cls, i) => {
+        classProbs[cls] = parseFloat((exps[i] / sumExp).toFixed(4));
+      });
+    }
+
+    return { classProbs, rawProbs, logits };
+  } finally {
+    // Always dispose tensors to prevent memory leaks. The raw tensor is disposed
+    // ONLY when we decoded it here; a shared tensor belongs to the caller.
+    if (ownTensor && rawTensor) tf.dispose(rawTensor);
+    if (inputTensor) tf.dispose(inputTensor);
+    outTensors.forEach(t => t && t.dispose && t.dispose());
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Open-set / OOD scores
+// ---------------------------------------------------------------------------
+// Energy score (Liu et al., NeurIPS 2020): E(x) = -T * logSumExp(logits / T).
+// Lower energy = more in-distribution; higher = more OOD.
+function computeEnergy(logitsObj, T = 1.0) {
+  if (!logitsObj) return null;
+  const scaled = CIVIC_CLASSES.map(c => logitsObj[c] / T);
+  const maxV = Math.max(...scaled);
+  const lse = maxV + Math.log(scaled.reduce((s, v) => s + Math.exp(v - maxV), 0));
+  return -T * lse;
+}
+
+// Shannon entropy over the softmax vector (nats). Higher = more uncertain/OOD.
+function computeEntropy(classProbs) {
+  let h = 0;
+  for (const c of CIVIC_CLASSES) {
+    const p = classProbs[c];
+    if (p > 0) h -= p * Math.log(p);
+  }
+  return h;
+}
+
+// Decide whether an image is out-of-distribution (not a civic issue the model
+// knows). Uses energy when logits are available, else falls back to entropy.
+function isOutOfDistribution(classProbs, logits) {
+  if (OOD_CONFIG.method === 'energy' && logits && OOD_CONFIG.energy_threshold != null) {
+    const energy = computeEnergy(logits, OOD_CONFIG.temperature || 1.0);
+    return { ood: energy > OOD_CONFIG.energy_threshold, score: energy, metric: 'energy' };
+  }
+  // Entropy fallback (works on softmax-only models).
+  const entropy = computeEntropy(classProbs);
+  const thr = OOD_CONFIG.entropy_threshold != null ? OOD_CONFIG.entropy_threshold : DEFAULT_OOD.entropy_threshold;
+  return { ood: entropy > thr, score: entropy, metric: 'entropy' };
+}
+
+// ---------------------------------------------------------------------------
+// Core decision logic: should we block this submission?
+//
+// opts:
+//   logits   — raw logits object (or null) for energy-based OOD
+//   openSet  — true when the declared category is the open-set "Others" case.
+//              In open-set mode this function NEVER returns block:true; it only
+//              produces advisory suggestions. A genuine novel civic issue is
+//              therefore always accepted.
+// ---------------------------------------------------------------------------
+function decideBlock(classProbs, declaredCategory, opts = {}) {
+  const { logits = null, openSet = false } = opts;
+  const declaredClass = CATEGORY_TO_CLASS[declaredCategory];
+
+  // Blocking is suppressed entirely in ADVISORY_MODE, and for any declared
+  // class that calibration flagged as unreliable (RELIABLE[class] === false).
+  // In those cases the rules still run to produce advisory reason/suggestion
+  // metadata, but the final decision degrades to block:false (never reject).
+  const canBlock = !ADVISORY_MODE && RELIABLE[declaredClass] !== false;
+
+  // Find the highest confidence class (used by every branch below)
+  let topClass = null;
+  let topProb = 0;
+  for (const [cls, prob] of Object.entries(classProbs)) {
+    if (prob > topProb) {
+      topProb = prob;
+      topClass = cls;
+    }
+  }
+
+  // OOD assessment (energy if logits present, else entropy fallback)
+  const ood = isOutOfDistribution(classProbs, logits);
+
+  // -------------------------------------------------------------------------
+  // OPEN-SET "Others": never hard-block. Surface advisory metadata only.
+  // -------------------------------------------------------------------------
+  if (openSet || !declaredClass) {
+    return {
+      block: false,
+      reason: ood.ood ? 'others_ood_advisory' : 'others_open_set',
+      declaredClass: declaredClass || 'others',
+      declaredProb: declaredClass ? (classProbs[declaredClass] || 0) : 0,
+      topClass,
+      topProb,
+      oodScore: ood.score,
+      oodMetric: ood.metric,
+      suggestion: (topClass && topProb >= 0.5 && CLASS_TO_CATEGORY[topClass])
+        ? `This looks like a "${CLASS_TO_CATEGORY[topClass]}" issue — you may want to re-categorize it.`
+        : '',
+    };
+  }
+
+  const declaredProb = classProbs[declaredClass] ?? 0;
+  // Use ?? (not ||) so a calibrated threshold of 0.0 is honored. The V2S retrain
+  // intentionally sets potholes/streetlight thresholds to 0.0 to DISABLE the
+  // RULE1 low-confidence block for those classes (relying on RULE0 OOD + RULE2
+  // mismatch instead). With `||`, 0.0 was falsy and silently reverted to the
+  // stale 0.45/0.40 defaults, hard-blocking exactly the domain-gap citizen
+  // photos the retrain was meant to accept.
+  const threshold = CLASS_THRESHOLDS[declaredClass] ?? DEFAULT_THRESHOLDS[declaredClass] ?? 0.35;
+
+  // Class-aware relative margin: tighter for the correlated potholes<->drainage pair.
+  const pairMargin = (ROAD_PAIR.has(declaredClass) && ROAD_PAIR.has(topClass))
+    ? RULE2_MARGIN_ROAD
+    : RULE2_MARGIN;
+
+  // -------------------------------------------------------------------------
+  // RULE 0 (OOD): image doesn't look like ANY known civic issue → block.
+  // For a specific declared category this is a hard block (the photo is junk /
+  // off-topic). Open-set Others already returned above, so this never blocks
+  // a novel-but-genuine report.
+  // -------------------------------------------------------------------------
+  if (ood.ood) {
+    return {
+      block: canBlock,
+      reason: 'ood_image',
+      declaredClass,
+      declaredProb,
+      threshold,
+      topClass,
+      topProb,
+      oodScore: ood.score,
+      oodMetric: ood.metric,
+      message: `The uploaded image doesn't appear to clearly show a recognizable civic issue. Please upload a clear photo of the "${declaredCategory}" problem.`,
+      suggestion: 'If this is a different kind of issue, select the "Others" category.',
+    };
+  }
+
+  // RULE 1: Declared class confidence is too low → block
+  if (declaredProb < threshold) {
+    return {
+      block: canBlock,
+      reason: 'low_confidence',
+      declaredClass,
+      declaredProb,
+      threshold,
+      topClass,
+      topProb,
+      message: `The uploaded image does not appear to match the selected category "${declaredCategory}" (confidence: ${(declaredProb * 100).toFixed(0)}%, required: ${(threshold * 100).toFixed(0)}%). Please upload a photo that clearly shows the issue.`,
+      suggestion: topClass !== declaredClass
+        ? `The image appears to show a "${topClass}" issue instead (${(topProb * 100).toFixed(0)}% confidence).`
+        : 'Please upload a clearer photo of the actual issue.',
+    };
+  }
+
+  // RULE 2: A different class is ahead by more than the (class-aware) margin → block.
+  // Margin tightened from the old fixed 0.20 to 0.12 globally, 0.05 for the
+  // potholes<->drainage pair so a pothole can no longer slip through as drainage.
+  if (topClass !== declaredClass && topProb > declaredProb + pairMargin) {
+    return {
+      block: canBlock,
+      reason: 'category_mismatch',
+      declaredClass,
+      declaredProb,
+      threshold,
+      topClass,
+      topProb,
+      message: `The uploaded image appears to show a "${topClass}" issue (${(topProb * 100).toFixed(0)}%), not "${declaredCategory}" (${(declaredProb * 100).toFixed(0)}%). Please select the correct category or upload a matching photo.`,
+      suggestion: `Consider reporting this as a "${topClass}" issue instead.`,
+    };
+  }
+
+  // All checks passed — accept the submission
+  return {
+    block: false,
+    reason: 'accepted',
+    declaredClass,
+    declaredProb,
+    threshold,
+    topClass,
+    topProb,
+    oodScore: ood.score,
+    oodMetric: ood.metric,
+  };
+}
+
+// =============================================================================
+// PUBLIC API — routes/health call these; state stays encapsulated here.
+// =============================================================================
+// ---------------------------------------------------------------------------
+// TF backend selection. tfjs' default 'cpu' backend is pure-JS math — the
+// slowest path — so on a shared 0.1-CPU host a civic forward pass takes
+// ~90-140s. The WASM backend (SIMD) runs the same ops several times faster
+// with NO native binaries and NO build toolchain, and a small WASM heap that
+// fits the 512MB free tier. Try WASM first, FALL BACK to cpu on any failure —
+// correctness must never depend on the fast path: a broken backend would make
+// classifyCivicImage throw, and the fail-open layers would then wave every
+// upload through unchecked. Force the old path with TF_BACKEND=cpu.
+let ACTIVE_BACKEND = 'cpu';
+async function initBackend() {
+  const want = (process.env.TF_BACKEND || 'wasm').toLowerCase();
+  if (want !== 'wasm') {
+    try { await tf.setBackend('cpu'); await tf.ready(); } catch (_) { /* cpu is always present */ }
+    ACTIVE_BACKEND = tf.getBackend();
+    console.log(`[tf] Backend forced to '${ACTIVE_BACKEND}' (TF_BACKEND=${want}).`);
+    return ACTIVE_BACKEND;
+  }
+  try {
+    const wasm = require('@tensorflow/tfjs-backend-wasm');
+    // Point the backend at the .wasm binaries shipped in the package's dist/.
+    const distDir = path.dirname(require.resolve('@tensorflow/tfjs-backend-wasm'));
+    if (typeof wasm.setWasmPaths === 'function') {
+      wasm.setWasmPaths(distDir.endsWith(path.sep) ? distDir : distDir + path.sep);
+    }
+    const ok = await tf.setBackend('wasm');
+    await tf.ready();
+    ACTIVE_BACKEND = tf.getBackend();
+    if (!ok || ACTIVE_BACKEND !== 'wasm') {
+      throw new Error(`setBackend('wasm') returned ${ok}, active='${ACTIVE_BACKEND}'`);
+    }
+    console.log('[tf] WASM backend active (SIMD) — faster inference on shared CPU.');
+  } catch (e) {
+    console.error('[tf] WASM backend init failed — falling back to pure-JS cpu backend:', e.message);
+    try { await tf.setBackend('cpu'); await tf.ready(); } catch (_) { /* ignore */ }
+    ACTIVE_BACKEND = tf.getBackend();
+    console.warn(`[tf] Backend in use: '${ACTIVE_BACKEND}' (slower, but classification stays correct).`);
+  }
+  return ACTIVE_BACKEND;
+}
+
+async function loadAll() {
+  // Select the compute backend BEFORE any model loads — the backend a model is
+  // compiled against is fixed at load time, so switching after would be a no-op.
+  await initBackend();
+  loadThresholds();
+  // NSFW model is optional RAM-wise. On a memory-tight host that OOMs even with
+  // CLIP off, DISABLE_NSFW=true drops nsfwjs (~saves headroom); adult-content
+  // pre-screen is then skipped (civic classifier stays active).
+  if (process.env.DISABLE_NSFW === 'true') {
+    console.warn('[nsfw] DISABLE_NSFW=true — content moderation OFF (memory-saving).');
+  } else {
+    await loadNsfwModel();
+  }
+  await loadCivicModel();
+  // CLIP (open-set "Others") is the heaviest component (~150MB). On memory-tight
+  // hosts (e.g. Render free 512MB) set DISABLE_CLIP=true to skip it — "Others"
+  // then falls back to keyword TITLE_ROUTES routing (see infer.js). Civic 4-class
+  // + NSFW moderation stay fully active either way.
+  if (process.env.DISABLE_CLIP === 'true') {
+    console.log('[clip] DISABLE_CLIP=true — CLIP not loaded; "Others" uses keyword fallback.');
+    return { clipReady: false };
+  }
+  const clipReady = await othersClip.load();
+  return { clipReady };
+}
+
+function getMeta() {
+  return {
+    civicModel,
+    nsfwModel,
+    ADVISORY_MODE,
+    CIVIC_CLASSES,
+    clipReady: othersClip.isReady(),
+    backend: ACTIVE_BACKEND,
+  };
+}
+
+// Current civic model handle (or null if not yet loaded / load failed). Routes
+// use this instead of reading the module-scoped `civicModel` directly.
+function getCivicModel() {
+  return civicModel;
+}
+
+// Decode a base64 image to a [H,W,3] tensor ONCE, so infer() can share it across
+// checkNSFW + classifyCivicImage instead of decoding the same JPEG/PNG twice.
+// Caller MUST dispose it (disposeTensor) — see infer.js.
+function decodeSharedTensor(base64Str) {
+  return decodeImageToTensor(base64Str);
+}
+function disposeTensor(t) {
+  if (t && t.dispose) { try { t.dispose(); } catch (_) { /* already disposed */ } }
+}
+
+module.exports = {
+  loadAll,
+  getMeta,
+  getCivicModel,
+  checkNSFW,
+  classifyCivicImage,
+  decideBlock,
+  loadThresholds,
+  othersClip,
+  CIVIC_CLASSES,
+  CATEGORY_TO_CLASS,
+  TITLE_ROUTES,
+  decodeSharedTensor,
+  disposeTensor,
+};

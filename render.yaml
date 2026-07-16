@@ -1,0 +1,60 @@
+# Render blueprint — FixMyCity backend + ML co-running in ONE free service.
+#
+# WHY one service: Render Free gives 750 instance-hours/month PER WORKSPACE
+# (shared). Two always-on services = ~1460 hr > 750 → one suspends mid-month.
+# Co-running backend + ML in a single process fits ~730 hr/month, indefinitely.
+#
+# ML_INLINE=true → backend calls the ML pipeline in-process (no second service,
+# no HTTP hop). DISABLE_CLIP=true → skip the 150MB CLIP model so total RAM stays
+# well under the 512MB free cap (measured ~280MB peak during inference). "Others"
+# category then uses keyword fallback; civic 4-class + NSFW moderation stay live.
+#
+# Native Node runtime (NOT Docker) → no credit card required on Render Free.
+# Persistent process → no per-request timeout; slow (~25-60s) tfjs inference on
+# shared CPU completes fine. Add an external uptime pinger (e.g. cron-job.org)
+# hitting /api/health every ~14 min so the service never sleeps.
+#
+# Deploy: New → Blueprint → point at this repo. Set the secret env vars
+# (sync:false) in the Render dashboard after the first deploy.
+services:
+  - type: web
+    name: fixmycity
+    runtime: node
+    # IMPORTANT: root stays at the REPO ROOT (no rootDir). Render makes files
+    # outside rootDir unavailable, so a subfolder rootDir would hide ml-service
+    # from the in-process require. We `cd` into each folder in the commands
+    # instead — the whole repo is checked out at the root.
+    plan: free
+    buildCommand: cd backend && npm install && cd ../ml-service && npm install --omit=dev
+    startCommand: cd backend && npm start
+    # NO healthCheckPath ON PURPOSE. Render's HTTP health check has a fixed ~5s
+    # timeout. Pure-JS tfjs civic inference is SYNCHRONOUS and blocks the single
+    # 0.1-CPU event loop for 25-60s per photo — during that block /api/health
+    # can't respond in 5s, so Render marks the instance unhealthy and restarts it
+    # MID-INFERENCE → crashloop (502) + failed citizen submissions. Without a
+    # healthCheckPath Render falls back to TCP port-bind liveness: the port binds
+    # instantly in app.listen (before ML load) and stays bound through inference,
+    # so the persistent process is never killed for a slow HTTP response. This
+    # matches the "persistent process → no per-request timeout" design above.
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=400"   # tuned for 512MB container. Pure-JS
+        # tfjs keeps tensors IN the V8 heap, so heap+baseline must stay < 512.
+        # 460 tipped over (container OOM); ~256 (Node default on 512MB cgroup)
+        # aborts mid-load (heap OOM 134). 400 loads AND fits with headroom.
+      - key: ML_INLINE
+        value: "true"          # run ML in-process (single free service)
+      - key: DISABLE_CLIP
+        value: "true"          # skip CLIP → fit 512MB (Others → keyword fallback)
+      # DISABLE_NSFW: set to "true" to skip NSFW model (~95MB saved, ~3-8s faster
+      # per image). Leave unset to keep content moderation active.
+      - key: ML_TIMEOUT_MS
+        value: "120000"        # generous; shared-CPU tfjs inference is slow
+      - key: MONGO_URI
+        sync: false            # set in dashboard (Atlas connection string)
+      - key: JWT_SECRET
+        sync: false            # set in dashboard (long random string)
+      - key: CORS_ORIGIN
+        sync: false            # set to your Vercel frontend URL

@@ -4,12 +4,13 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Overview
 
-FixMyCity is a civic complaint platform. Citizens register, file complaints about pothole / drainage / streetlight / other issues (with photo proof), and track status; admins review complaints, forward them to municipal departments, and resolve them. It has two independently-run halves:
+FixMyCity is a civic complaint platform. Citizens register, file complaints about pothole / drainage / streetlight / other issues (with photo proof), and track status; admins review complaints, forward them to municipal departments, and resolve them. It has three independently-run components:
 
-- **Frontend** (`frontend/`): Create React App (React 19) served on port 3000.
-- **Backend** (`backend/`): Express + MongoDB (Mongoose) API on port 5000, with pure-JS TensorFlow.js + MobileNet image advisory.
+- **Frontend** (`frontend/`): Vite + TypeScript + Redux + MUI (Material UI) served on port **5173** in dev. Replaced the old Create React App frontend.
+- **Backend** (`backend/`): Express + MongoDB (Mongoose) API on port **5000**, with JWT auth (Bearer tokens), bcrypt passwords, Brevo SMTP OTP for superadmin, and pure-JS TensorFlow.js + MobileNet image advisory.
+- **ML Service** (`ml-service/`): Separate Python/FastAPI image classification service.
 
-These are separate npm packages with separate `package.json` and `node_modules`. The CRA dev server proxies API calls to `http://localhost:5000` via the `"proxy"` field in `frontend/package.json`.
+These are separate npm packages with separate `package.json` and `node_modules`. The Vite dev server proxies `/api/*` to `http://localhost:5000` via `frontend/vite.config.ts`.
 
 ## Commands
 
@@ -17,10 +18,9 @@ Frontend (run from `frontend/`):
 ```bash
 cd frontend
 npm install
-npm start                 # dev server on :3000
-npm run build             # production build to /build
-npm test                  # interactive Jest watch mode
-npm test -- --watchAll=false src/App.test.js   # run a single test file once (CI-style)
+npm run dev              # Vite dev server on :5173 (proxies /api/* → :5000)
+npm run build            # TypeScript compile + Vite production build to /dist
+npm run preview          # Preview the production build locally
 ```
 
 Backend (run from `backend/`):

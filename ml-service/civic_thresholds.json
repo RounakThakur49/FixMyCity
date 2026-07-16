@@ -1,0 +1,60 @@
+{
+  "schema_version": 2,
+  "model_backbone": "EfficientNetV2S",
+  "class_order": [
+    "drainage",
+    "others",
+    "potholes",
+    "streetlight"
+  ],
+  "temperature": 0.4165,
+  "calibration_warning": null,
+  "val_accuracy_uncalibrated": 0.9756,
+  "val_accuracy_calibrated": 0.9756,
+  "val_macro_f1": 0.975,
+  "logits_source": "head",
+  "thresholds": {
+    "drainage": 0.002,
+    "potholes": 0.005,
+    "streetlight": 0.0
+  },
+  "reliable": {
+    "drainage": true,
+    "potholes": true,
+    "streetlight": true
+  },
+  "ood": {
+    "method": "energy",
+    "temperature": 0.4165,
+    "energy_threshold": -2.123187,
+    "entropy_threshold": 0.503279,
+    "percentile": 95,
+    "energy_in_dist_mean": -5.060707,
+    "energy_in_dist_std": 1.928437,
+    "entropy_in_dist_mean": 0.073892,
+    "entropy_in_dist_max": 1.092079
+  },
+  "per_class_metrics": {
+    "drainage": {
+      "threshold": 0.002,
+      "precision": 0.7008,
+      "recall": 0.997,
+      "f1": 0.8231,
+      "n_samples": 336
+    },
+    "potholes": {
+      "threshold": 0.005,
+      "precision": 0.7009,
+      "recall": 1.0,
+      "f1": 0.8241,
+      "n_samples": 410
+    },
+    "streetlight": {
+      "threshold": 0.0,
+      "precision": 0.7008,
+      "recall": 1.0,
+      "f1": 0.8241,
+      "n_samples": 417
+    }
+  }
+}

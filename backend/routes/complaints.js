@@ -4,10 +4,68 @@ const Complaint = require('../models/Complaint');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { complaintLimiter } = require('../middleware/security');
 const { getFormattedDate } = require('../utils/datetime');
-const {
-  checkNSFW, classifyCivicImage, decideBlock,
-  CATEGORY_TO_CLASS, othersClip, getCivicModel,
-} = require('../ml/pipeline');
+const { ML_INLINE, inlineInfer } = require('../mlInline');
+
+// Image validation runs in the ML pipeline. TWO modes:
+//
+//  1. HTTP (default) — ml-service runs as a SEPARATE process/host. We POST each
+//     photo to ${ML_SERVICE_URL}/api/infer. Config:
+//       ML_SERVICE_URL — base URL (e.g. https://x.onrender.com). Unset → skip.
+//       ML_KEY         — shared secret sent as X-ML-KEY (must match the service).
+//       ML_TIMEOUT_MS  — abort after this many ms (default 60000).
+//
+//  2. IN-PROCESS (ML_INLINE=true) — backend and ML co-run in ONE process (e.g. a
+//     single Render free service, to fit the 750hr/month + 512MB limits). infer()
+//     is called directly via ../mlInline — no network hop, no ML_KEY needed. Set
+//     DISABLE_CLIP=true too to keep RAM under 512MB.
+//
+// NOTE the generous HTTP timeout default: pure-JS @tensorflow/tfjs inference runs
+// ~15-60s/image on shared CPU. The timeout only guards a genuinely dead service;
+// it must sit WELL above real latency or slow-but-working inferences fail open.
+//
+// Either way this FAILS OPEN: any error → null verdict → complaint saved unchecked.
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || '';
+const ML_KEY = process.env.ML_KEY || '';
+const ML_TIMEOUT_MS = parseInt(process.env.ML_TIMEOUT_MS, 10) || 60000;
+
+// Run inference. Returns the verdict object, or null on any failure so the caller
+// fails open (complaint saved unchecked).
+async function callMlInfer({ imageBase64, type, title }) {
+  // In-process path.
+  if (ML_INLINE) {
+    try {
+      return await inlineInfer({ imageBase64, type, title });
+    } catch (e) {
+      console.error('[ml] in-process infer failed — failing open:', e.message);
+      return null;
+    }
+  }
+  // HTTP path.
+  if (!ML_SERVICE_URL) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ML_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${ML_SERVICE_URL}/api/infer`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(ML_KEY ? { 'X-ML-KEY': ML_KEY } : {}),
+      },
+      body: JSON.stringify({ imageBase64, type, title }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.error(`[ml] infer returned HTTP ${res.status} — failing open.`);
+      return null;
+    }
+    return await res.json();
+  } catch (e) {
+    console.error('[ml] infer call failed — failing open:', e.name === 'AbortError' ? 'timeout' : e.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // GET /api/complaints
 // -----------------------------------------------------------------------------
@@ -21,10 +79,11 @@ router.get('/api/complaints', async (req, res) => {
   try {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
+    if (req.query.citizenPhone) filter.citizenPhone = req.query.citizenPhone;
 
     const paginated = req.query.page !== undefined || req.query.limit !== undefined;
     if (!paginated) {
-      const complaints = await Complaint.find(filter).sort({ updatedAt: -1 });
+      const complaints = await Complaint.find(filter).select('-image -images').sort({ updatedAt: -1 });
       return res.status(200).json(complaints);
     }
 
@@ -33,7 +92,7 @@ router.get('/api/complaints', async (req, res) => {
     const skip = (page - 1) * limit;
 
     const [data, total] = await Promise.all([
-      Complaint.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limit),
+      Complaint.find(filter).select('-image -images').sort({ updatedAt: -1 }).skip(skip).limit(limit),
       Complaint.countDocuments(filter),
     ]);
 
@@ -65,6 +124,9 @@ router.post('/api/complaints', requireAuth, complaintLimiter, async (req, res) =
     const activeImage = image || (images && images[0]);
     const isBase64 = activeImage && activeImage.startsWith('data:image/');
 
+    // Default advisory subdoc. The `at` timestamp is stamped here (backend owns
+    // time authority + the Asia/Kolkata string format); the ML service returns
+    // imageCheck without `at`.
     let imageCheck = {
       model: 'none',
       matched: null,
@@ -76,195 +138,30 @@ router.post('/api/complaints', requireAuth, complaintLimiter, async (req, res) =
     };
 
     // -------------------------------------------------------------------------
-    // STEP 1 — Content moderation: block adult/explicit/inappropriate images
+    // Image validation — delegated to the ML microservice (NSFW + civic + CLIP).
+    // The service returns a verdict we apply verbatim:
+    //   action:'block' → return its httpStatus (422) + blockPayload to the client
+    //   action:'accept' → store its imageCheck on the complaint (we re-stamp `at`)
+    // FAIL-OPEN: if the service is unset/unreachable/times-out, callMlInfer()
+    // returns null and the complaint is saved unchecked (same guarantee the old
+    // in-process pipeline gave when a model failed to load).
     // -------------------------------------------------------------------------
     if (isBase64) {
-      try {
-        const nsfwResult = await checkNSFW(activeImage);
-        if (nsfwResult && nsfwResult.blocked) {
-          console.warn(`[nsfw] BLOCKED upload: ${nsfwResult.category} (${(nsfwResult.score * 100).toFixed(0)}%)`);
-          return res.status(422).json({
-            blocked: true,
-            reason: 'inappropriate_content',
-            message: nsfwResult.message,
-            suggestion: 'Please upload a clear photo of the civic issue you are reporting.',
-            nsfwDetails: {
-              flaggedCategory: nsfwResult.category,
-              confidence: parseFloat((nsfwResult.score * 100).toFixed(1)),
-              allScores: nsfwResult.allScores,
-            },
+      const verdict = await callMlInfer({ imageBase64: activeImage, type, title });
+      if (verdict) {
+        if (verdict.action === 'block') {
+          return res.status(verdict.httpStatus || 422).json(verdict.blockPayload || {
+            blocked: true, message: 'Image rejected by validation.',
           });
         }
-      } catch (e) {
-        console.error('[nsfw] Pre-screen error — continuing:', e.message);
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // STEP 2 — Image validation — only for base64 uploads from citizens
-    // -------------------------------------------------------------------------
-    if (isBase64 && CATEGORY_TO_CLASS[type]) {
-      if (!getCivicModel()) {
-        // Model not loaded — log and allow (never block citizens due to ML failure)
-        imageCheck.note = 'AI validation unavailable — model not loaded. Submission accepted.';
-        console.warn('[civic] Model not loaded — skipping image validation for', type);
+        // action === 'accept' — adopt the service's imageCheck, stamp our time.
+        imageCheck = { ...(verdict.imageCheck || {}), at: getFormattedDate() };
       } else {
-        try {
-          const classProbs = await classifyCivicImage(activeImage);
-
-          if (!classProbs) {
-            imageCheck.note = 'AI validation returned no result — submission accepted.';
-          } else {
-            const actualProbs = classProbs.classProbs || classProbs;
-            const logits = classProbs.logits || null;
-
-            const probsStr = Object.entries(actualProbs)
-              .sort(([, a], [, b]) => b - a)
-              .map(([cls, p]) => `${cls}:${(p * 100).toFixed(0)}%`)
-              .join(', ');
-
-            if (type === 'Others') {
-              // ---------------------------------------------------------------
-              // OPEN-SET "Others": NEVER hard-blocked. CLIP (text+image
-              // embedding similarity, others_clip.js) is authoritative for the
-              // advisory suggestion. Keyword TITLE_ROUTES is only a fallback
-              // when CLIP is unavailable. The civic model still ran above for
-              // advisory classProbs, but its decision is ignored for blocking.
-              // decideBlock is invoked with openSet:true so it can only emit
-              // advisory metadata (no 422 path for Others).
-              // ---------------------------------------------------------------
-              const decision = decideBlock(actualProbs, 'Others', { logits, openSet: true });
-
-              let advisoryNote = '';
-              let clipScores = null;
-              let clipSuggestion = null;
-              let clipOodScore = null;
-
-              let clip = null;
-              if (othersClip.isReady()) {
-                try {
-                  clip = await othersClip.classifyOthers({ imageBase64: activeImage, title });
-                } catch (clipErr) {
-                  console.error('[clip] classifyOthers error — falling back to advisory:', clipErr.message);
-                  clip = null;
-                }
-              }
-
-              if (clip) {
-                // CLIP authoritative advisory.
-                clipScores = clip.scores || null;
-                clipSuggestion = clip.suggestedClass || null;
-                clipOodScore = typeof clip.oodScore === 'number'
-                  ? parseFloat(clip.oodScore.toFixed(4)) : null;
-                const simStr = typeof clip.oodScore === 'number' ? clip.oodScore.toFixed(2) : '?';
-
-                if (clip.isCivic && clip.suggestedClass && clip.suggestedClass !== 'Others') {
-                  advisoryNote = `Looks closest to "${clip.suggestedClass}" (sim ${simStr}) — you may want to re-categorize.`;
-                } else if (clip.isCivic && clip.suggestedClass === 'Others') {
-                  advisoryNote = `Recognized as a "${clip.suggestedSubtype || 'general'}" issue.`;
-                } else {
-                  advisoryNote = 'Accepted as a novel/open-set civic issue.';
-                }
-                console.log(
-                  `[clip] Others "${title}" → suggested="${clip.suggestedClass}" ` +
-                  `subtype="${clip.suggestedSubtype}" sim=${simStr} isCivic=${clip.isCivic}`
-                );
-              } else {
-                // Fallback advisory: cheap keyword routing only. Never blocks.
-                const t = (title || '').toLowerCase();
-                let routedType = null;
-                for (const route of TITLE_ROUTES) {
-                  if (route.keywords.some(kw => t.includes(kw))) {
-                    routedType = route.targetType;
-                    break;
-                  }
-                }
-                if (routedType) {
-                  advisoryNote = `Based on the title, this may be a "${routedType}" issue — you may want to re-categorize.`;
-                  console.log(`[civic] Others title "${title}" → keyword advisory "${routedType}" (CLIP unavailable)`);
-                } else if (decision.suggestion) {
-                  advisoryNote = decision.suggestion;
-                } else {
-                  advisoryNote = 'Accepted as an open-set civic issue.';
-                }
-              }
-
-              console.log(
-                `[civic] declared="Others" (open-set) probs=[${probsStr}] ` +
-                `→ ✅ ACCEPT (${clip ? 'clip' : 'keyword/advisory'})`
-              );
-
-              imageCheck = {
-                model: 'custom-civic-4class-tfjs',
-                matched: true,
-                blocked: false,
-                score: decision.declaredProb,
-                classProbs: actualProbs,
-                note: advisoryNote,
-                clipScores,
-                clipSuggestion,
-                clipOodScore,
-                at: getFormattedDate(),
-              };
-              // Others is open-set: no hard-block / no 422 path.
-            } else {
-              // -------------------------------------------------------------
-              // Specific declared category: the civic model decides on the
-              // calibrated probabilities. decideBlock self-suppresses blocking
-              // in ADVISORY_MODE or when the class is flagged unreliable.
-              // -------------------------------------------------------------
-              const decision = decideBlock(actualProbs, type, { logits });
-
-              console.log(
-                `[civic] declared="${type}" class="${decision.declaredClass}" ` +
-                `declared_prob=${(decision.declaredProb * 100).toFixed(0)}% ` +
-                `threshold=${(decision.threshold || 0) * 100 || '?'}% ` +
-                `top="${decision.topClass}" top_prob=${(decision.topProb * 100).toFixed(0)}% ` +
-                `→ ${decision.block ? '❌ BLOCK' : '✅ ACCEPT'} (${decision.reason})`
-              );
-
-              imageCheck = {
-                model: 'custom-civic-4class-tfjs',
-                matched: !decision.block,
-                blocked: decision.block,
-                score: decision.declaredProb,
-                classProbs: actualProbs,
-                note: decision.block ? decision.message : `✅ Image matches "${type}" (${(decision.declaredProb * 100).toFixed(0)}% confidence).`,
-                at: getFormattedDate(),
-              };
-
-              // Block the submission — return 422 with user-friendly message
-              if (decision.block) {
-                return res.status(422).json({
-                  blocked: true,
-                  message: decision.message,
-                  suggestion: decision.suggestion || '',
-                  aiDetails: {
-                    declaredCategory: type,
-                    declaredClass: decision.declaredClass,
-                    declaredConfidence: parseFloat((decision.declaredProb * 100).toFixed(1)),
-                    topClass: decision.topClass,
-                    topConfidence: parseFloat((decision.topProb * 100).toFixed(1)),
-                    reason: decision.reason,
-                  },
-                });
-              }
-            }
-          }
-        } catch (inferenceErr) {
-          // Inference error — log but NEVER block the citizen
-          console.error('[civic] Inference error — allowing submission:', inferenceErr.message);
-          const looksPng = (typeof activeImage === 'string' && /^data:image\/png/i.test(activeImage))
-            || /PNG decoding/i.test(inferenceErr.message || '');
-          imageCheck.note = looksPng
-            ? 'png_unvalidated — image not screened by classifier'
-            : 'AI validation error — submission accepted without check.';
-        }
+        // Fail-open: ML service unavailable.
+        imageCheck.note = 'AI validation unavailable — submission accepted.';
       }
-    } else if (!isBase64) {
+    } else {
       imageCheck.note = 'URL or seed image — AI validation skipped.';
-    } else if (!CATEGORY_TO_CLASS[type]) {
-      imageCheck.note = `Unknown complaint type "${type}" — AI validation skipped.`;
     }
 
     // -------------------------------------------------------------------------
@@ -350,12 +247,34 @@ router.post('/api/complaints', requireAuth, complaintLimiter, async (req, res) =
 // Validate complaint ID format
 const COMPLAINT_ID_RE = /^CMP-\d+$/;
 
-router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
+// GET /api/complaints/:id
+// Returns single complaint details + status updates (for details panel compatibility)
+router.get('/api/complaints/:id', async (req, res) => {
   try {
     if (!COMPLAINT_ID_RE.test(req.params.id)) {
       return res.status(400).json({ message: 'Invalid complaint ID format.' });
     }
-    const { status, forwardedTo } = req.body;
+    const complaint = await Complaint.findOne({ id: req.params.id });
+    if (!complaint) return res.status(404).json({ message: 'Complaint not found.' });
+
+    res.status(200).json({
+      success: true,
+      complaint,
+      statusUpdates: complaint.updates || [],
+    });
+  } catch (e) {
+    console.error('Get complaint detail error:', e);
+    res.status(500).json({ message: 'Failed to retrieve complaint details.' });
+  }
+});
+
+router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
+  try {
+    console.log('[PATCH status] id:', req.params.id, 'body:', JSON.stringify(req.body));
+    if (!COMPLAINT_ID_RE.test(req.params.id)) {
+      return res.status(400).json({ message: 'Invalid complaint ID format.' });
+    }
+    const { status, forwardedTo, title, description } = req.body;
     if (!status) return res.status(400).json({ message: 'Status field is required.' });
     const VALID_STATUSES = ['Submitted', 'In Review', 'Forwarded', 'Resolved'];
     if (!VALID_STATUSES.includes(status)) {
@@ -367,22 +286,28 @@ router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
 
     const timestamp = getFormattedDate();
     let note = '';
-    switch (status) {
-      case 'In Review': note = 'Area inspection requested by admin.'; break;
-      case 'Forwarded': note = `Issue forwarded to ${forwardedTo || 'respective department'}.`; break;
-      case 'Resolved':  note = 'Complaint resolved successfully.'; break;
-      default:          note = `Status updated to ${status}.`;
+    if (title || description) {
+      note = [title, description].filter(Boolean).join(' — ');
+    } else {
+      switch (status) {
+        case 'In Review': note = 'Area inspection requested by admin.'; break;
+        case 'Forwarded': note = `Issue forwarded to ${forwardedTo || 'respective department'}.`; break;
+        case 'Resolved':  note = 'Complaint resolved successfully.'; break;
+        default:          note = `Status updated to ${status}.`;
+      }
     }
 
     complaint.status = status;
     if (forwardedTo !== undefined && forwardedTo !== '') complaint.forwardedTo = forwardedTo;
     complaint.updatedAt = timestamp;
+    if (!complaint.citizenName) complaint.citizenName = 'Unknown';
+    if (!complaint.citizenPhone) complaint.citizenPhone = 'unknown';
     complaint.updates.push({ label: status, note, at: timestamp });
     await complaint.save();
     res.status(200).json(complaint);
   } catch (e) {
-    console.error('Update status error:', e);
-    res.status(500).json({ message: 'Failed to update complaint status.' });
+    console.error('Update status error:', e.message, e.errors ? JSON.stringify(e.errors) : '');
+    res.status(500).json({ message: 'Failed to update complaint status.', detail: e.message });
   }
 });
 
