@@ -55,6 +55,8 @@ Each tier runs and deploys independently. See [`DEPLOY.md`](./DEPLOY.md) for the
 ## Features
 
 - **Role-based dashboards** — citizen (own complaints only), admin (all complaints + status update), superadmin (analytics + user management + admin creation)
+- **Forward-only status workflow** — a complaint moves Submitted → In Review / Forwarded → Resolved and **cannot be backtracked**; once Resolved it's final. Enforced server-side (409 on any backward move) and mirrored in the admin UI (earlier stages disabled, resolved complaint locked)
+- **Per-admin / per-citizen activity logs** — the superadmin dashboard shows each admin only the status updates *they* made (every update stamps the acting admin from their JWT) and each citizen only *their own* complaint history
 - **Complaint ID tracking** — each complaint gets a sequential `CMP-XXXX` reference, displayed on cards and detail views
 - **Search & filter** — search by complaint ID, title, description, category, or citizen name; status filter chips (Pending / Progress / Completed) toggle on click
 - **Complaint details** — full timeline with progress stepper, citizen info (name/phone/registration date), forwarded department, map, and photo evidence
@@ -275,6 +277,19 @@ DISABLE_RATE_LIMIT=true npx playwright test
 - The image-picking helper skips known-contaminated dataset prefixes (`scrape_`/`drain_`/`bing_`) so ACCEPT assertions run on clean images.
 - HTML report: `playwright-report/`.
 
+### Unit tests (no server / DB needed)
+
+Pure-logic rules are extracted into `backend/utils/` so they can be tested hermetically with plain Node `assert` (no MongoDB, no running server):
+
+```bash
+cd backend
+node test_status_order.js       # forward-only status transitions (17 cases)
+node test_activity_filter.js    # per-admin activity attribution (8 cases)
+```
+
+- `test_status_order.js` exercises `utils/statusOrder.js` — the same `canTransition()` the PATCH route uses. Verifies forward moves pass, backward moves and any change to a Resolved complaint are rejected, and In Review ⇄ Forwarded (same citizen stage) is allowed.
+- `test_activity_filter.js` exercises `utils/activityFilter.js` — the same `buildAdminActivity()` the superadmin route uses. Verifies two admins get **different** logs, legacy (un-stamped) updates leak into no admin's log, and an unknown admin id yields an empty (not lumped-together) log.
+
 ---
 
 ## Project structure
@@ -477,7 +492,7 @@ node server.js
 | GET | `/api/stats` | Complaint + user counts | public |
 | GET | `/api/complaints` | List complaints. No params → full array (back-compat). `?page&limit&status` → paginated `{data,page,limit,total,totalPages}` | public |
 | POST | `/api/complaints` | Create complaint (runs ML pipeline) | **citizen+** |
-| PATCH | `/api/complaints/:id/status` | Update status | **admin** |
+| PATCH | `/api/complaints/:id/status` | Update status (forward-only; 409 on backtrack or edit to a resolved complaint) | **admin** |
 | DELETE | `/api/complaints/:id` | Delete complaint | **admin** |
 | GET | `/api/reviews` | List reviews | public |
 | POST | `/api/reviews` | Submit review | **auth** |

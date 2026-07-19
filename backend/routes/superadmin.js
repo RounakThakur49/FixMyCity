@@ -24,6 +24,7 @@ const Complaint = require('../models/Complaint');
 const { requireSuperAdmin } = require('../middleware/auth');
 const { issueToken } = require('../middleware/auth');
 const { maskAadhar } = require('../utils/mask');
+const { buildAdminActivity } = require('../utils/activityFilter');
 
 // All superadmin routes require superadmin JWT
 router.use(requireSuperAdmin);
@@ -279,10 +280,17 @@ router.get('/api/superadmin/citizens/:id/activity', async (req, res) => {
     if (!citizen)
       return res.status(404).json({ message: 'Citizen not found.' });
 
-    const complaints = await Complaint.find({ citizenPhone: citizen.phone })
-      .sort({ createdAt: -1 })
-      .select('id title type status location createdAt updatedAt updates')
-      .lean();
+    // Complaints are owned via citizenPhone (the only owner key on the doc). Guard
+    // against a blank/missing phone: matching { citizenPhone: '' } would collide —
+    // it'd return EVERY phone-less citizen's complaints, making their activity logs
+    // look identical. A citizen with no phone simply has no attributable activity.
+    const phone = (citizen.phone || '').trim();
+    const complaints = phone
+      ? await Complaint.find({ citizenPhone: phone })
+          .sort({ createdAt: -1 })
+          .select('id title type status location createdAt updatedAt updates')
+          .lean()
+      : [];
 
     res.json({
       citizen: {
@@ -320,30 +328,18 @@ router.get('/api/superadmin/admins/:id/activity', async (req, res) => {
     if (!admin)
       return res.status(404).json({ message: 'Admin not found.' });
 
-    // Find all complaints that have status updates — admins are the only ones who
-    // change status, so updates[] entries (beyond the initial Submitted) represent
-    // admin actions. We can't attribute to a specific admin yet (updates don't store
-    // adminId), so we show all non-Submitted updates across all complaints.
-    const complaints = await Complaint.find({ 'updates.1': { $exists: true } })
+    // Per-admin activity: since July 2026 every status update stamps the acting
+    // admin's _id under updates[].byId (from their verified JWT). Filter to only
+    // the updates THIS admin made — scope the DB query to complaints that contain
+    // at least one update by this admin, then pick out exactly those entries.
+    const adminId = String(admin._id);
+    const complaints = await Complaint.find({ 'updates.byId': adminId })
       .sort({ updatedAt: -1 })
       .select('id title type status location createdAt updatedAt updates')
       .lean();
 
-    const activity = [];
-    for (const c of complaints) {
-      const adminUpdates = (c.updates || []).filter(u => u.label !== 'Submitted');
-      for (const u of adminUpdates) {
-        activity.push({
-          title:       `Updated "${c.title}" → ${u.label}`,
-          description: u.note || '',
-          dateTime:    u.at || c.updatedAt || '',
-          complaintId: c.id,
-        });
-      }
-    }
-
-    // Sort by dateTime descending
-    activity.sort((a, b) => (b.dateTime || '').localeCompare(a.dateTime || ''));
+    // Attribution + newest-first ordering live in the shared, unit-tested helper.
+    const activity = buildAdminActivity(complaints, adminId);
 
     res.json({
       admin: {

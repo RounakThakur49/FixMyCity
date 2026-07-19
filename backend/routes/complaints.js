@@ -4,6 +4,7 @@ const Complaint = require('../models/Complaint');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { complaintLimiter } = require('../middleware/security');
 const { getFormattedDate } = require('../utils/datetime');
+const { canTransition } = require('../utils/statusOrder');
 const { ML_INLINE, inlineInfer } = require('../mlInline');
 
 // Image validation runs in the ML pipeline. TWO modes:
@@ -284,6 +285,16 @@ router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
     const complaint = await Complaint.findOne({ id: req.params.id });
     if (!complaint) return res.status(404).json({ message: 'Complaint not found.' });
 
+    // ── Monotonic status ordering (no backtracking) ──────────────────────────
+    // Enforce the forward-only lifecycle via the shared rule module (the frontend
+    // mirrors the same ranks). Resolved is terminal; backward moves are rejected;
+    // same-stage moves (In Review ⇄ Forwarded) are allowed. 409 Conflict on a
+    // state-machine violation so the admin UI surfaces the reason.
+    const transition = canTransition(complaint.status, status);
+    if (!transition.allowed) {
+      return res.status(409).json({ message: transition.reason });
+    }
+
     const timestamp = getFormattedDate();
     let note = '';
     if (title || description) {
@@ -302,7 +313,16 @@ router.patch('/api/complaints/:id/status', requireAdmin, async (req, res) => {
     complaint.updatedAt = timestamp;
     if (!complaint.citizenName) complaint.citizenName = 'Unknown';
     if (!complaint.citizenPhone) complaint.citizenPhone = 'unknown';
-    complaint.updates.push({ label: status, note, at: timestamp });
+    // Stamp WHO performed this status change (from the verified JWT, never the
+    // body) so the superadmin activity log can attribute updates per-admin.
+    complaint.updates.push({
+      label: status,
+      note,
+      at: timestamp,
+      byId:   req.auth?.sub || '',
+      byName: req.auth?.name || '',
+      byRole: req.auth?.role || '',
+    });
     await complaint.save();
     res.status(200).json(complaint);
   } catch (e) {

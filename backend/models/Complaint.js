@@ -13,6 +13,24 @@ const UpdateSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
+  // Who performed this update. Stamped from the acting admin's JWT (req.auth) in
+  // the status-PATCH route so the superadmin activity log can attribute each
+  // status change to the specific admin who made it. All optional so pre-existing
+  // updates (written before actor tracking, July 2026) still validate — those
+  // legacy entries simply have no attributable actor and are excluded from
+  // per-admin activity logs.
+  byId: {
+    type: String,     // acting admin's _id (JWT sub)
+    default: '',
+  },
+  byName: {
+    type: String,     // acting admin's display name (JWT name), for readability
+    default: '',
+  },
+  byRole: {
+    type: String,     // 'admin' | 'superadmin'
+    default: '',
+  },
 }, { _id: false });
 
 const ImageCheckSchema = new mongoose.Schema({

@@ -32,6 +32,25 @@ const WORK_STATUS_OPTIONS = [
     { value: 'completed', label: 'Completed' }
 ];
 
+// Monotonic lifecycle — mirrors the backend guard in routes/complaints.js. A
+// complaint may only move FORWARD: pending → work-on-progress → completed.
+// Ranks let us disable any option below the current stage and lock a completed
+// complaint outright. The backend enforces the same rule (409 on violation);
+// this is the UX layer so admins can't even pick an invalid transition.
+const STAGE_RANK: Record<string, number> = {
+    'pending': 0,
+    'work-on-progress': 1,
+    'completed': 2,
+};
+
+// Normalize any backend/display status string to one of the 3 UI stages.
+function toStage(rawStatus: string): string {
+    const s = (rawStatus || '').toLowerCase();
+    if (s.includes('complete') || s.includes('resolve')) return 'completed';
+    if (s.includes('progress') || s.includes('review') || s.includes('forward')) return 'work-on-progress';
+    return 'pending';
+}
+
 export default function UpdateStatus({ complaint, onClose, isInline = false, onSuccess }: UpdateStatusProps) {
     const dispatch = useAppDispatch();
     const { user } = useSelector((state: RootState) => state.auth);
@@ -40,6 +59,12 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
     const loginUserObj = user as any;
     const userId = loginUserObj?.user?.id || loginUserObj?.id || '';
     const role   = loginUserObj?.user?.role || loginUserObj?.role || 'admin';
+
+    // Current stage of THIS complaint (from its stored status) — the floor below
+    // which the admin cannot go, and the flag for the "already completed" lock.
+    const currentStage = toStage(complaint?.status || '');
+    const currentRank = STAGE_RANK[currentStage] ?? 0;
+    const isLockedCompleted = currentStage === 'completed';
 
     const [workstatus, setWorkstatus] = useState('');
     const [title, setTitle] = useState('');
@@ -59,19 +84,9 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
         const minutes = String(now.getMinutes()).padStart(2, '0');
         setDateTime(`${year}-${month}-${day}T${hours}:${minutes}`);
 
-        // Prefill default status based on current complaint status if available
-        if (complaint) {
-            const currentStatus = (complaint.status || '').toLowerCase();
-            if (currentStatus.includes('progress') || currentStatus.includes('work-on-progress')) {
-                setWorkstatus('work-on-progress');
-            } else if (currentStatus.includes('complete')) {
-                setWorkstatus('completed');
-            } else {
-                setWorkstatus('pending');
-            }
-        } else {
-            setWorkstatus('pending');
-        }
+        // Prefill the dropdown to the complaint's CURRENT stage (never below it) so
+        // the admin's starting selection is already valid under the monotonic rule.
+        setWorkstatus(complaint ? toStage(complaint.status || '') : 'pending');
     }, [complaint]);
 
     // Clean up photo preview URL
@@ -110,6 +125,17 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
 
         if (!workstatus || !title.trim() || !description.trim()) {
             setFormValidation('Please fill out all required fields (Status, Title, and Description).');
+            return;
+        }
+
+        // Enforce the monotonic rule client-side too (the backend also rejects with
+        // 409). Block a backward move or any edit to an already-completed complaint.
+        if (isLockedCompleted) {
+            setFormValidation('This complaint is already resolved. Resolved complaints are final and cannot be changed.');
+            return;
+        }
+        if ((STAGE_RANK[workstatus] ?? 0) < currentRank) {
+            setFormValidation('Status can only move forward. You cannot revert to an earlier stage.');
             return;
         }
 
@@ -158,6 +184,12 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
                 </Box>
             )}
 
+            {isLockedCompleted && (
+                <Alert severity="info" sx={{ mb: 3, borderRadius: '6px' }}>
+                    This complaint is <strong>resolved</strong>. Resolved complaints are final and cannot be reopened or changed.
+                </Alert>
+            )}
+
             {formValidation && (
                 <Alert severity="warning" sx={{ mb: 3, borderRadius: '6px' }}>
                     {formValidation}
@@ -182,11 +214,18 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
                     disabled={updateStatusLoading}
                     sx={{ mb: 2.5 }}
                 >
-                    {WORK_STATUS_OPTIONS.map((option) => (
-                        <MenuItem key={option.value} value={option.value}>
-                            {option.label}
-                        </MenuItem>
-                    ))}
+                    {WORK_STATUS_OPTIONS.map((option) => {
+                        // Disable any stage below the complaint's current stage —
+                        // status can only move forward. (A completed complaint is
+                        // fully locked; see the guard/alert below.)
+                        const optionRank = STAGE_RANK[option.value] ?? 0;
+                        const disabled = optionRank < currentRank;
+                        return (
+                            <MenuItem key={option.value} value={option.value} disabled={disabled}>
+                                {option.label}{disabled ? ' — already passed' : ''}
+                            </MenuItem>
+                        );
+                    })}
                 </TextField>
 
                 {/* Title input */}
@@ -357,7 +396,7 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
                         type="submit"
                         variant="contained"
                         fullWidth
-                        disabled={updateStatusLoading}
+                        disabled={updateStatusLoading || isLockedCompleted}
                         sx={{
                             backgroundColor: '#0f172a',
                             color: '#ffffff',
@@ -369,7 +408,7 @@ export default function UpdateStatus({ complaint, onClose, isInline = false, onS
                             }
                         }}
                     >
-                        {updateStatusLoading ? <CircularProgress size={24} sx={{ color: '#fff' }} /> : 'Update Status'}
+                        {updateStatusLoading ? <CircularProgress size={24} sx={{ color: '#fff' }} /> : (isLockedCompleted ? 'Complaint Resolved' : 'Update Status')}
                     </Button>
                 </Box>
             </form>
