@@ -157,7 +157,14 @@ Complaints are keyed throughout by a custom `id` field (`CMP-2401`, `CMP-2402`, 
 A complaint moves `Submitted → In Review → Forwarded → Resolved` (enum in `models/Complaint.js`). The status PATCH route auto-appends an entry to the `updates[]` array with a canned note per status; the frontend `complaintDetails.tsx` renders this as a timeline with status badges. `forwardedTo` names a municipal department.
 
 ### Super admin system (July 2026)
-A hard-coded `superadmin` role sits above `admin`. Seeded at boot from env vars (`SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD`). Login requires **email OTP 2FA** sent via **Brevo SMTP** (`BREVO_SMTP_USER` + `BREVO_API_KEY` must be set in production; in dev without creds, OTP prints to console). No hardcoded OTP bypass — all OTPs are cryptographically generated and bcrypt-verified.
+A hard-coded `superadmin` role sits above `admin`. Seeded at boot from env vars (`SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD`). Login requires **email OTP 2FA** via **Brevo** (`backend/utils/emailOtp.js`). No hardcoded OTP bypass — all OTPs are cryptographically generated and bcrypt-verified.
+
+**OTP delivery is dual-path, auto-selected by `BREVO_API_KEY` prefix** (this is the fix for the "OTP works locally but hangs/loops on the deployed link" bug — Render's free tier **blocks outbound SMTP ports 25/465/587**, so the nodemailer path can never connect there and, without a timeout, stalled the login request):
+- **`xkeysib-…` (v3 API key) → Brevo HTTP API** (`POST https://api.brevo.com/v3/smtp/email`, port **443**). Works on Render/any PaaS that blocks SMTP. **Use this in production.**
+- **`xsmtpsib-…` (SMTP password) or anything else → nodemailer SMTP** (needs `BREVO_SMTP_USER` too). Works locally; blocked on Render.
+- **No creds → stub** (OTP logged to console, dev only).
+
+All three paths have **hard timeouts** (8s SMTP connect/greeting/socket, 9s AbortController on the HTTP fetch, override via `OTP_SEND_TIMEOUT_MS`) so a blocked port or slow API can never hang login again — a send failure is caught in `routes/auth.js` and login still proceeds (the OTP is already in the DB). The sender (`BREVO_FROM_EMAIL`) must be a **verified sender** in Brevo or the HTTP API returns 4xx.
 
 **Backend routes** (`routes/superadmin.js`, all gated by `requireSuperAdmin`):
 - `GET /api/superadmin/stats` — complaint analytics (by status, location hotspot, category, longest pending)
