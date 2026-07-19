@@ -14,17 +14,26 @@ async function seedDatabase() {
     // ------------------------------------------------------------------
     const superadminExists = await Admin.findOne({ role: 'superadmin' });
     if (!superadminExists) {
-      const saEmail = process.env.SUPERADMIN_EMAIL || 'debmalyobarman2003@gmail.com';
-      const saPassword = process.env.SUPERADMIN_PASSWORD || 'SuperAdmin@2024';
-      const hash = await bcrypt.hash(saPassword, 12);
-      await new Admin({
-        name:     'Super Admin',
-        username: 'superadmin',
-        email:    saEmail,
-        password: hash,
-        role:     'superadmin',
-      }).save();
-      console.log(`[seed] Superadmin seeded  (login: ${saEmail})`);
+      // NO hardcoded fallback — a committed default password for the highest-
+      // privilege account is a credential leak (GitGuardian flagged the former
+      // hardcoded password + personal-email defaults, July 2026). Both must come
+      // from the host env (set on Render/Oracle; add to backend/.env for local).
+      // If either is unset we skip seeding rather than create a known-default root.
+      const saEmail = process.env.SUPERADMIN_EMAIL;
+      const saPassword = process.env.SUPERADMIN_PASSWORD;
+      if (!saEmail || !saPassword) {
+        console.warn('[seed] SUPERADMIN_EMAIL / SUPERADMIN_PASSWORD not set — skipping superadmin seed (no hardcoded default). Set both env vars to seed the root account.');
+      } else {
+        const hash = await bcrypt.hash(saPassword, 12);
+        await new Admin({
+          name:     'Super Admin',
+          username: 'superadmin',
+          email:    saEmail,
+          password: hash,
+          role:     'superadmin',
+        }).save();
+        console.log(`[seed] Superadmin seeded  (login: ${saEmail})`);
+      }
     }
 
     // ------------------------------------------------------------------

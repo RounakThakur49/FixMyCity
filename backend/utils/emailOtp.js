@@ -28,8 +28,11 @@ const {
   BREVO_API_KEY    = '',
   BREVO_FROM_EMAIL = 'no-reply@fixmycity.in',
   BREVO_FROM_NAME  = 'FixMyCity',
-  NODE_ENV         = 'development',
 } = process.env;
+
+// Hard cap on how long any single send attempt may take. Keeps a blocked
+// SMTP port or a hung API call from ever stalling the login request.
+const SEND_TIMEOUT_MS = parseInt(process.env.OTP_SEND_TIMEOUT_MS || '9000', 10);
 
 // Lazily create the transporter once so the connection pool is reused.
 let _transporter = null;
@@ -44,6 +47,11 @@ function getTransporter() {
       user: BREVO_SMTP_USER,
       pass: BREVO_API_KEY,
     },
+    // Fail fast instead of hanging the login request when the SMTP port is
+    // unreachable (e.g. Render's free tier blocks outbound 25/465/587).
+    connectionTimeout: 8000, // ms to establish the TCP connection
+    greetingTimeout:   8000, // ms to wait for the SMTP greeting
+    socketTimeout:     8000, // ms of inactivity on the socket
   });
   return _transporter;
 }
@@ -133,15 +141,41 @@ function buildOtpHtml(otp) {
  * @returns {Promise<void>}
  */
 async function sendOtpEmail(toEmail, otp) {
-  // Stub mode — credentials not configured
-  if (!BREVO_SMTP_USER || !BREVO_API_KEY) {
+  // Stub mode — no API key at all. Log the OTP so dev/boot still works.
+  if (!BREVO_API_KEY) {
     console.warn(
       `[emailOtp] ⚠️  Brevo credentials not set. Stubbing email delivery.\n` +
-      `[emailOtp] OTP for ${toEmail}: ${otp}  (visible in console only — configure BREVO_SMTP_USER + BREVO_API_KEY for real delivery)`
+      `[emailOtp] OTP for ${toEmail}: ${otp}  (visible in console only — configure BREVO_API_KEY for real delivery)`
     );
     return;
   }
 
+  // Route by key type:
+  //   • v3 API key ("xkeysib-…")  → HTTP API over port 443. REQUIRED on hosts
+  //     that block outbound SMTP (e.g. Render's free tier).
+  //   • SMTP password ("xsmtpsib-…") or anything else → nodemailer SMTP, which
+  //     needs BREVO_SMTP_USER too. Works locally where 587 is reachable.
+  if (BREVO_API_KEY.startsWith('xkeysib-')) {
+    return sendViaHttpApi(toEmail, otp);
+  }
+
+  if (!BREVO_SMTP_USER) {
+    console.warn(
+      `[emailOtp] ⚠️  SMTP mode needs BREVO_SMTP_USER (none set). Stubbing.\n` +
+      `[emailOtp] OTP for ${toEmail}: ${otp}  (use a v3 API key "xkeysib-…" for HTTP delivery, or set BREVO_SMTP_USER)`
+    );
+    return;
+  }
+
+  return sendViaSmtp(toEmail, otp);
+}
+
+/**
+ * sendViaSmtp(toEmail, otp) — deliver over Brevo SMTP via nodemailer.
+ * Uses the SMTP password (BREVO_API_KEY, prefix "xsmtpsib-") + BREVO_SMTP_USER.
+ * Note: will fail on hosts that block outbound SMTP ports (25/465/587).
+ */
+async function sendViaSmtp(toEmail, otp) {
   const transporter = getTransporter();
 
   const mailOptions = {
@@ -154,11 +188,63 @@ async function sendOtpEmail(toEmail, otp) {
 
   try {
     const info = await transporter.sendMail(mailOptions);
-    console.log(`[emailOtp] OTP email sent to ${toEmail}  messageId=${info.messageId}`);
+    console.log(`[emailOtp] OTP email sent to ${toEmail} via SMTP  messageId=${info.messageId}`);
   } catch (err) {
     // Surface the error so the caller can decide to abort or warn the user
-    console.error(`[emailOtp] Failed to send OTP email to ${toEmail}:`, err.message);
+    console.error(`[emailOtp] Failed to send OTP email to ${toEmail} via SMTP:`, err.message);
     throw err;
+  }
+}
+
+/**
+ * sendViaHttpApi(toEmail, otp)
+ *
+ * Sends the OTP through Brevo's transactional HTTP API
+ * (POST https://api.brevo.com/v3/smtp/email) over HTTPS (443).
+ *
+ * Why this exists: many PaaS hosts (Render free tier, etc.) BLOCK outbound
+ * SMTP ports (25/465/587) to curb spam, so nodemailer's transporter hangs
+ * until timeout and never delivers. Port 443 is never blocked, so the HTTP
+ * API works where SMTP cannot. Requires a v3 API key (prefix `xkeysib-`),
+ * NOT the SMTP password (prefix `xsmtpsib-`).
+ *
+ * Uses the global `fetch` built into Node 18+ with an AbortController hard
+ * timeout so a slow/hung API call can never block the login request.
+ */
+async function sendViaHttpApi(toEmail, otp) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+  try {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'api-key': BREVO_API_KEY,
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({
+        sender: { name: BREVO_FROM_NAME, email: BREVO_FROM_EMAIL },
+        to: [{ email: toEmail }],
+        subject: 'FixMyCity — Super Admin OTP Verification',
+        textContent: `Your FixMyCity Super Admin OTP is: ${otp}\nThis code expires in 10 minutes. Do not share it.`,
+        htmlContent: buildOtpHtml(otp),
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      // Brevo returns a JSON error body (e.g. sender not verified, bad key)
+      const detail = await res.text().catch(() => '');
+      throw new Error(`Brevo API ${res.status}: ${detail.slice(0, 300)}`);
+    }
+
+    const data = await res.json().catch(() => ({}));
+    console.log(`[emailOtp] OTP email sent to ${toEmail} via HTTP API  messageId=${data.messageId || 'n/a'}`);
+  } catch (err) {
+    console.error(`[emailOtp] Failed to send OTP email to ${toEmail} via HTTP API:`, err.message);
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

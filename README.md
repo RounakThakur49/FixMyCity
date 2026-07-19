@@ -55,6 +55,8 @@ Each tier runs and deploys independently. See [`DEPLOY.md`](./DEPLOY.md) for the
 ## Features
 
 - **Role-based dashboards** — citizen (own complaints only), admin (all complaints + status update), superadmin (analytics + user management + admin creation)
+- **Forward-only status workflow** — a complaint moves Submitted → In Review / Forwarded → Resolved and **cannot be backtracked**; once Resolved it's final. Enforced server-side (409 on any backward move) and mirrored in the admin UI (earlier stages disabled, resolved complaint locked)
+- **Per-admin / per-citizen activity logs** — the superadmin dashboard shows each admin only the status updates *they* made (every update stamps the acting admin from their JWT) and each citizen only *their own* complaint history
 - **Complaint ID tracking** — each complaint gets a sequential `CMP-XXXX` reference, displayed on cards and detail views
 - **Search & filter** — search by complaint ID, title, description, category, or citizen name; status filter chips (Pending / Progress / Completed) toggle on click
 - **Complaint details** — full timeline with progress stepper, citizen info (name/phone/registration date), forwarded department, map, and photo evidence
@@ -134,8 +136,16 @@ JWT_SECRET=change-me-to-a-long-random-string
 CORS_ORIGIN=http://localhost:3000
 ML_SERVICE_URL=http://localhost:7860
 ML_KEY=           # must MATCH the ml-service ML_KEY (blank both for local dev)
+
+# Super-admin OTP email (optional in dev — OTP prints to console if unset)
+BREVO_API_KEY=    # v3 API key "xkeysib-…" (HTTP API) OR SMTP password "xsmtpsib-…" (SMTP)
+BREVO_SMTP_USER=  # required ONLY for the SMTP path (ignored by the HTTP-API path)
+BREVO_FROM_EMAIL=you@example.com   # must be a Brevo-verified sender
+BREVO_FROM_NAME=FixMyCity
 ```
 
+> **🔒 Never commit `.env`.** All `.env` files are gitignored (`backend/.env`, `frontend/.env`, `ml-service/.env`); only the `.env.example` templates are tracked. The values above are placeholders — put real secrets (Mongo URI, JWT secret, Brevo key) only in your local `.env` or your host's dashboard, never in a tracked file.
+>
 > **`JWT_SECRET` is required for real auth.** If unset, the server falls back to an insecure dev value and warns at boot — fine for local dev, never for a deployed build. Generate one with `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`.
 >
 > **`ML_SERVICE_URL`** points at the ML service (step 3). If unset or unreachable, image validation is skipped and complaints save unchecked (**fail-open**).
@@ -177,7 +187,12 @@ Default users are seeded on first connect (only if the DB is empty), defined in
 | Admin | Email (from seed) | Set in `seed.js` |
 | Super Admin | `SUPERADMIN_EMAIL` env var | `SUPERADMIN_PASSWORD` env var |
 
-Super admin login requires email OTP verification (2FA) via **Brevo SMTP**. Set `BREVO_SMTP_USER` + `BREVO_API_KEY` in `backend/.env`. In dev without Brevo creds, OTP prints to server console.
+Super admin login requires email OTP verification (2FA) via **Brevo**. Delivery auto-routes on the `BREVO_API_KEY` prefix:
+
+- **`xkeysib-…`** (v3 API key) → Brevo **HTTP API** over port **443**. Use this in production — required on hosts that block outbound SMTP (e.g. **Render's free tier blocks ports 25/465/587**).
+- **`xsmtpsib-…`** (SMTP password) → **SMTP** via nodemailer (needs `BREVO_SMTP_USER` too). Works locally where port 587 is reachable.
+
+In dev without any `BREVO_API_KEY`, the OTP prints to the server console. All send paths have a hard timeout so a blocked port can never hang the login request.
 
 **Change the seeded credentials in `backend/db/seed.js` before any public deployment** — do not ship demo passwords. Passwords are bcrypt-hashed; each user needs a distinct Aadhaar.
 
@@ -198,6 +213,8 @@ curl http://localhost:7860/health        # ML service directly
 
 Each tier has its own `.env.example` — copy it to `.env` for local dev, or set the values in your host's dashboard for deployment.
 
+> **Never commit real secrets.** All `.env` files (`backend/.env`, `frontend/.env`, `ml-service/.env`) are gitignored — only the `.env.example` templates are tracked. Keep `MONGO_URI`, `JWT_SECRET`, `ML_KEY`, and `BREVO_API_KEY` in `.env` or your host's dashboard, never in tracked files. If a secret is ever pushed, rotate it (it stays in git history even after deletion).
+
 **Frontend** — uses relative `/api/*` paths. In production, the hosting platform (Vercel) proxies these to the backend via `vercel.json` rewrites. No env vars needed for the API URL.
 
 | Var | Purpose |
@@ -214,6 +231,9 @@ Each tier has its own `.env.example` — copy it to `.env` for local dev, or set
 | `ML_SERVICE_URL` | Base URL of the ML service. Unset/unreachable → image validation skipped (fail-open). |
 | `ML_KEY` | Shared secret sent as `X-ML-KEY` to the ML service. Must **match** the ML service's `ML_KEY`. |
 | `PORT` | Backend listen port (default 5000). |
+| `BREVO_API_KEY` | Brevo key for super-admin OTP email. A **v3 API key** (`xkeysib-…`) sends over the **HTTP API (port 443)** — required on hosts that block SMTP (e.g. Render free tier). An SMTP password (`xsmtpsib-…`) uses nodemailer SMTP (ports 25/465/587) — works locally, blocked on Render. |
+| `BREVO_SMTP_USER` | Brevo SMTP login. Only needed for the SMTP path (`xsmtpsib-` key); ignored on the HTTP API path. |
+| `BREVO_FROM_EMAIL` / `BREVO_FROM_NAME` | OTP sender identity. The from-address must be a **verified sender** in Brevo or the API rejects it. |
 
 **ML service** (`ml-service/.env.example`):
 
@@ -256,6 +276,19 @@ DISABLE_RATE_LIMIT=true npx playwright test
 - The suite logs in once as a seeded citizen in `beforeAll` and attaches the JWT to every `POST /api/complaints` (complaint creation now requires auth). Reads need no token.
 - The image-picking helper skips known-contaminated dataset prefixes (`scrape_`/`drain_`/`bing_`) so ACCEPT assertions run on clean images.
 - HTML report: `playwright-report/`.
+
+### Unit tests (no server / DB needed)
+
+Pure-logic rules are extracted into `backend/utils/` so they can be tested hermetically with plain Node `assert` (no MongoDB, no running server):
+
+```bash
+cd backend
+node test_status_order.js       # forward-only status transitions (17 cases)
+node test_activity_filter.js    # per-admin activity attribution (8 cases)
+```
+
+- `test_status_order.js` exercises `utils/statusOrder.js` — the same `canTransition()` the PATCH route uses. Verifies forward moves pass, backward moves and any change to a Resolved complaint are rejected, and In Review ⇄ Forwarded (same citizen stage) is allowed.
+- `test_activity_filter.js` exercises `utils/activityFilter.js` — the same `buildAdminActivity()` the superadmin route uses. Verifies two admins get **different** logs, legacy (un-stamped) updates leak into no admin's log, and an unknown admin id yields an empty (not lumped-together) log.
 
 ---
 
@@ -459,7 +492,7 @@ node server.js
 | GET | `/api/stats` | Complaint + user counts | public |
 | GET | `/api/complaints` | List complaints. No params → full array (back-compat). `?page&limit&status` → paginated `{data,page,limit,total,totalPages}` | public |
 | POST | `/api/complaints` | Create complaint (runs ML pipeline) | **citizen+** |
-| PATCH | `/api/complaints/:id/status` | Update status | **admin** |
+| PATCH | `/api/complaints/:id/status` | Update status (forward-only; 409 on backtrack or edit to a resolved complaint) | **admin** |
 | DELETE | `/api/complaints/:id` | Delete complaint | **admin** |
 | GET | `/api/reviews` | List reviews | public |
 | POST | `/api/reviews` | Submit review | **auth** |

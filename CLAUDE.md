@@ -55,6 +55,14 @@ DISABLE_RATE_LIMIT=true npx playwright test    # tests/e2e/complaints.spec.js
 ```
 `DISABLE_RATE_LIMIT=true` (backend env, dev/test only) bypasses the 5/min complaint limiter so the suite's rapid POSTs don't 429. The E2E helper skips known-contaminated dataset prefixes (`scrape_`/`drain_`/`bing_`) so ACCEPT assertions run on clean images.
 
+Unit tests (Node `assert`, hermetic — no DB/server, run from `backend/`):
+```bash
+cd backend
+node test_status_order.js       # monotonic status-ordering rule (utils/statusOrder.js) — 17 cases
+node test_activity_filter.js    # per-admin activity attribution (utils/activityFilter.js) — 8 cases
+```
+Both extract the pure decision logic the routes import (`canTransition`, `buildAdminActivity`) so the invariants have regression coverage without a live Mongo. `test_api_integration.js` still exercises the full ML-classifier path against a running server.
+
 ML retraining (Python, run from `backend/`):
 ```bash
 cd backend
@@ -156,17 +164,28 @@ Complaints are keyed throughout by a custom `id` field (`CMP-2401`, `CMP-2402`, 
 ### Status workflow + timeline
 A complaint moves `Submitted → In Review → Forwarded → Resolved` (enum in `models/Complaint.js`). The status PATCH route auto-appends an entry to the `updates[]` array with a canned note per status; the frontend `complaintDetails.tsx` renders this as a timeline with status badges. `forwardedTo` names a municipal department.
 
+**Forward-only lifecycle (monotonic, no backtracking — July 2026).** Status can only advance, never regress. The 4 enum values collapse to **3 citizen-visible stages** (the frontend maps `In Review` AND `Forwarded` → the single `work-on-progress` state), so the guard ranks by stage: `Submitted`=0 (pending) → `In Review`/`Forwarded`=1 (in progress) → `Resolved`=2 (complete). Rules: **`Resolved` is terminal** (once complete, no further change at all); any move to a **lower** stage is rejected; **same-stage** moves (`In Review` ⇄ `Forwarded`) are allowed (lateral in-progress work, invisible to the citizen — forwarding is a legitimate in-progress action). The rule is a pure, unit-tested module — `backend/utils/statusOrder.js` (`canTransition(from,to)` → `{allowed, reason}`), tested by `backend/test_status_order.js` (17 cases). The PATCH route returns **409 Conflict** with the reason on a violation; the frontend `updateStatus.tsx` **mirrors the same ranks** (`STAGE_RANK`) — disables backward options in the dropdown, shows a locked "already resolved" banner, and blocks submit — so an admin can't even pick an invalid transition. Defense-in-depth: UX guard + server guard, same rule.
+
 ### Super admin system (July 2026)
-A hard-coded `superadmin` role sits above `admin`. Seeded at boot from env vars (`SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD`). Login requires **email OTP 2FA** sent via **Brevo SMTP** (`BREVO_SMTP_USER` + `BREVO_API_KEY` must be set in production; in dev without creds, OTP prints to console). No hardcoded OTP bypass — all OTPs are cryptographically generated and bcrypt-verified.
+A hard-coded `superadmin` role sits above `admin`. Seeded at boot from env vars (`SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD`). Login requires **email OTP 2FA** via **Brevo** (`backend/utils/emailOtp.js`). No hardcoded OTP bypass — all OTPs are cryptographically generated and bcrypt-verified.
+
+**OTP delivery is dual-path, auto-selected by `BREVO_API_KEY` prefix** (this is the fix for the "OTP works locally but hangs/loops on the deployed link" bug — Render's free tier **blocks outbound SMTP ports 25/465/587**, so the nodemailer path can never connect there and, without a timeout, stalled the login request):
+- **`xkeysib-…` (v3 API key) → Brevo HTTP API** (`POST https://api.brevo.com/v3/smtp/email`, port **443**). Works on Render/any PaaS that blocks SMTP. **Use this in production.**
+- **`xsmtpsib-…` (SMTP password) or anything else → nodemailer SMTP** (needs `BREVO_SMTP_USER` too). Works locally; blocked on Render.
+- **No creds → stub** (OTP logged to console, dev only).
+
+All three paths have **hard timeouts** (8s SMTP connect/greeting/socket, 9s AbortController on the HTTP fetch, override via `OTP_SEND_TIMEOUT_MS`) so a blocked port or slow API can never hang login again — a send failure is caught in `routes/auth.js` and login still proceeds (the OTP is already in the DB). The sender (`BREVO_FROM_EMAIL`) must be a **verified sender** in Brevo or the HTTP API returns 4xx.
 
 **Backend routes** (`routes/superadmin.js`, all gated by `requireSuperAdmin`):
 - `GET /api/superadmin/stats` — complaint analytics (by status, location hotspot, category, longest pending)
 - `GET /api/superadmin/admins` — list all regular admins
 - `POST /api/superadmin/admins` — create new admin (name, username, email, phone, password)
 - `DELETE /api/superadmin/admins/:id` — delete admin (cannot self-delete or delete superadmin)
-- `GET /api/superadmin/admins/:id/activity` — admin activity log (derived from complaint `updates[]`)
+- `GET /api/superadmin/admins/:id/activity` — **per-admin** activity log (only the status updates THIS admin made — filtered via `updates[].byId`, see actor-tracking note below)
 - `GET /api/superadmin/citizens` — paginated citizen list
-- `GET /api/superadmin/citizens/:id/activity` — citizen complaint history
+- `GET /api/superadmin/citizens/:id/activity` — **per-citizen** complaint history (scoped by `citizenPhone`; guarded against blank-phone collisions)
+
+**Per-user activity attribution (July 2026).** Both activity logs are now genuinely per-user. Each `updates[]` entry stamps the acting admin (`byId`/`byName`/`byRole`, from the verified JWT — never a body field) at status-change time, so the admin-activity endpoint filters to `{ 'updates.byId': adminId }` and returns only that admin's own updates. The attribution logic is a pure, unit-tested module — `backend/utils/activityFilter.js` (`buildAdminActivity(complaints, adminId)`), tested by `backend/test_activity_filter.js` (8 cases, incl. "A's and B's logs are different" and "legacy no-`byId` entries leak into nobody"). Citizen activity was already scoped by `citizenPhone`; it's now additionally guarded so a citizen with a blank phone returns an empty log instead of colliding with every other phone-less citizen. **Legacy `updates[]` entries written before actor-tracking have no `byId` and are excluded from per-admin logs** (they can't be attributed to anyone).
 
 **Frontend** (`useage.tsx`): analytics dashboard with bar chart, max-complaint location map, user management tabs (Admins/Citizens), activity log dialogs, Create Admin dialog, Delete Admin / Block Citizen actions.
 
@@ -299,6 +318,8 @@ In `ml-service/` (runtime, loaded by the inference service):
 - **`TITLE_ROUTES` was a swallowed `ReferenceError` (fixed for free by the ML split)** — the Others keyword-fallback path used `TITLE_ROUTES` in the old `backend/routes/complaints.js`, but that constant was defined-and-unexported in `pipeline.js` and never imported into the route → it threw a `ReferenceError` that the fail-open catch silently absorbed (keyword advisory never actually ran). The orchestration now lives in `ml-service/infer.js`, which **imports `TITLE_ROUTES` from `./ml/pipeline`** (pipeline.js now exports it) → the keyword fallback works.
 - **Client-side image compression added (July 2026)** — `complaintRegister.tsx` now compresses photos to 800×800 JPEG 70% quality via canvas before sending. Previously raw phone photos (3-12MP, 3-5MB) were sent as-is, causing larger payloads and slower ML decode. Fallback to raw `readAsDataURL` if canvas fails.
 - **ML block messages shown in citizen UI (July 2026)** — `citizen.saga.ts` now extracts both `message` and `suggestion` from 422 responses and concatenates them for the error display. `complaintRegister.tsx` renders a structured `<Alert>` with "Image Validation Failed" header + full explanation. Citizens see exactly why their image was rejected and what to do (e.g., "The image appears to show a 'potholes' issue instead — consider re-categorizing").
+- **Admin activity logs were identical for every admin (July 2026)** — `GET /api/superadmin/admins/:id/activity` ignored `:id` and flattened *every* admin's status updates into one list, because `updates[]` entries didn't record *who* made them. Fixed by adding actor fields (`byId`/`byName`/`byRole`) to `UpdateSchema` and stamping them from the verified JWT (`req.auth`) in the status-PATCH route (never from the body). The endpoint now queries `{ 'updates.byId': adminId }` and filters to that admin's own entries via the shared, unit-tested `utils/activityFilter.js`. Legacy updates (no `byId`) are correctly attributed to no one. Also hardened `GET /api/superadmin/citizens/:id/activity`: a citizen with a blank phone no longer collides with every other phone-less citizen (blank phone → empty activity instead of `{ citizenPhone: '' }` matching everyone).
+- **Complaint status could move backward (July 2026)** — the status-PATCH route accepted any valid enum unconditionally, so an admin could revert Resolved → In Review → Submitted (and citizens saw the regression). Fixed with a monotonic lifecycle guard in the shared `utils/statusOrder.js` (`canTransition`): the 4 enum values collapse to 3 citizen stages (`Submitted`=0, `In Review`/`Forwarded`=1, `Resolved`=2); backward moves return **409 Conflict**, `Resolved` is terminal (no further change), and same-stage moves (In Review ⇄ Forwarded) stay allowed. `updateStatus.tsx` mirrors the same ranks in the UI — backward options are disabled and a resolved complaint locks the form — so the 409 is a safety net, not the primary UX. Both helpers are covered by hermetic unit tests (`backend/test_status_order.js`, `backend/test_activity_filter.js`).
 
 ### Search & filter (July 2026)
 - **Client-side search + status filter** added to both `adminHome.tsx` and `userHome.tsx`. Status chips (Active/Pending/Progress/Completed) are now **clickable toggles** — click to filter, click again to clear. A search bar supports text search across complaint ID (`CMP-XXXX`), title, description, category type, and citizen name (both views). Both filters compose (status + search). A "Clear filters" chip and result count appear when filters are active. Empty-state message shown when no complaints match. All filtering is client-side via `useMemo` (no backend changes needed — complaints are already loaded in full). The `ComplaintMap` on admin view updates to show only filtered complaints.
