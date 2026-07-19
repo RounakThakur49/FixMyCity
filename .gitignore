@@ -11,12 +11,17 @@ node_modules/
 # production
 build/
 
-# env (secrets — never commit)
+# env (secrets — never commit). Block every .env variant anywhere in the tree,
+# but ALWAYS keep the placeholder-only *.env.example files tracked so setup docs
+# work. (GitGuardian July 2026: the actual leak was a hardcoded superadmin
+# default in backend/db/seed.js — source, not a file — and is fixed there;
+# these rules stop any real .env from ever being committed alongside it.)
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
 backend/.env
 frontend/.env
 ml-service/.env
